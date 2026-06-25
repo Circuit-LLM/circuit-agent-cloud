@@ -19,11 +19,38 @@ const NAME = process.env.AGENT_NAME || 'agent';
 const LOG_FILE = path.join(DATA_DIR, 'agent.log');
 const HB_FILE = path.join(DATA_DIR, 'heartbeat.json');
 
-let cfg = { scanIntervalMs: 5000, paperTrading: true, strategy: 'dip-reversal' };
+// Off-box custody, handed in by the node-host (never the key — just a scoped,
+// rotating session token for this agent + epoch). When set, every entry is
+// authorized and signed by the signer; when absent, we run pure-paper locally.
+const SIGNER = process.env.CIRCUIT_SIGNER_URL || '';
+const AGENT_ID = process.env.CIRCUIT_AGENT_ID || '';
+const EPOCH = Number(process.env.CIRCUIT_AGENT_EPOCH || 0);
+const SESSION = process.env.CIRCUIT_AGENT_SESSION || '';
+const ADDRESS = process.env.CIRCUIT_AGENT_ADDRESS || '';
+
+let cfg = { scanIntervalMs: 5000, paperTrading: true, strategy: 'dip-reversal', tradeSizeSol: 0.01 };
 try {
   cfg = { ...cfg, ...JSON.parse(fs.readFileSync(path.join(DATA_DIR, 'config.json'), 'utf8')) };
 } catch {
   /* defaults */
+}
+
+// Ask the signer to authorize + sign a trade. The reply is either a signature
+// (custody confirmed it against policy + the fence) or a rejection code.
+async function signTrade(kind, token, sizeSol) {
+  if (!SIGNER) return { ok: true, code: 'paper-local', signature: null };
+  try {
+    const res = await fetch(`${SIGNER}/v1/agents/${AGENT_ID}/intent`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ epoch: EPOCH, token: SESSION, intent: { kind, token, sizeSol } }),
+      signal: AbortSignal.timeout(6000),
+    });
+    const j = await res.json().catch(() => ({}));
+    return res.ok ? j : { ok: false, code: j.code || `http-${res.status}`, error: j.error };
+  } catch (e) {
+    return { ok: false, code: 'signer-unreachable', error: e.message };
+  }
 }
 
 const started = Date.now();
@@ -31,6 +58,7 @@ let scans = 0;
 let pnlPct = 0;
 let positions = [];
 let running = true;
+let signedTrades = 0;
 
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
@@ -50,29 +78,48 @@ function heartbeat(state) {
     pnlPct: +pnlPct.toFixed(2),
     positions,
     paper: cfg.paperTrading !== false,
+    custody: SIGNER ? 'offbox-signer' : 'local',
+    address: ADDRESS || undefined,
+    signedTrades,
   };
   try {
     fs.writeFileSync(HB_FILE, JSON.stringify(hb));
   } catch {}
 }
 
-function tick() {
-  if (!running) return;
-  scans++;
-  // Toy paper strategy: occasionally open/close a position, walk P&L a touch.
-  const r = Math.random();
-  if (positions.length === 0 && r < 0.3) {
-    positions.push({ symbol: `TKN${scans}`, entryPnl: 0 });
-    log(`scan #${scans} — opened paper position ${positions[0].symbol}`);
-  } else if (positions.length && r < 0.4) {
-    const p = positions.pop();
-    const realized = (Math.random() - 0.45) * 4;
-    pnlPct += realized;
-    log(`scan #${scans} — closed ${p.symbol} ${realized >= 0 ? '+' : ''}${realized.toFixed(2)}% (total ${pnlPct.toFixed(2)}%)`);
-  } else {
-    log(`scan #${scans} — no setup (holding ${positions.length})`);
+let busy = false;
+async function tick() {
+  if (!running || busy) return;
+  busy = true;
+  try {
+    scans++;
+    // Toy strategy: occasionally enter/exit. Every ENTRY is routed through the
+    // signer — the agent has no key, so it can only trade if custody signs off.
+    const r = Math.random();
+    if (positions.length === 0 && r < 0.3) {
+      const token = `TKN${scans}`;
+      const size = cfg.tradeSizeSol ?? 0.01;
+      const sig = await signTrade('buy', token, size);
+      if (sig.ok) {
+        signedTrades++;
+        positions.push({ symbol: token, entryPnl: 0, sizeSol: size });
+        const tag = sig.signature ? `sig ${sig.signature.slice(0, 16)}…` : '(paper-local)';
+        log(`scan #${scans} — BUY ${token} ${size} SOL ✓ signed off-box ${tag}`);
+      } else {
+        log(`scan #${scans} — BUY ${token} DENIED by signer [${sig.code}] ${sig.error || ''}`);
+      }
+    } else if (positions.length && r < 0.4) {
+      const p = positions.pop();
+      const realized = (Math.random() - 0.45) * 4;
+      pnlPct += realized;
+      log(`scan #${scans} — closed ${p.symbol} ${realized >= 0 ? '+' : ''}${realized.toFixed(2)}% (total ${pnlPct.toFixed(2)}%)`);
+    } else {
+      log(`scan #${scans} — no setup (holding ${positions.length})`);
+    }
+    heartbeat('running');
+  } finally {
+    busy = false;
   }
-  heartbeat('running');
 }
 
 function shutdown(sig) {
@@ -87,5 +134,8 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 fs.mkdirSync(DATA_DIR, { recursive: true });
 log(`agentd up — name=${NAME} strategy=${cfg.strategy} paper=${cfg.paperTrading !== false} interval=${cfg.scanIntervalMs}ms`);
+log(SIGNER
+  ? `custody=offbox-signer wallet=${ADDRESS || '?'} epoch=${EPOCH} — no signing key on this host`
+  : `custody=local — no signer wired (pure paper)`);
 heartbeat('running');
 setInterval(tick, cfg.scanIntervalMs);

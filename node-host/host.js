@@ -19,8 +19,6 @@ const CFG = {
   maxAgents: Number(process.env.MAX_AGENTS || 5),
   maxCpu: Number(process.env.MAX_CPU || 1.0),
   maxMemoryMb: Number(process.env.MAX_MEMORY_MB || 512),
-  custodyMax: Number(process.env.CUSTODY_MAX ?? 3), // 0 keyOnNode .. 3 tee/any
-  tee: process.env.CONFIDENTIAL_TEE === '1',
   dataDir: process.env.HOST_DATA_DIR || path.join(os.homedir(), '.circuit-host'),
   key: process.env.CIRCUIT_CLOUD_KEY || '',
   heartbeatMs: Number(process.env.HEARTBEAT_MS || 8000),
@@ -56,6 +54,19 @@ function startAgent(a) {
 
   const { command, args } = resolveWorkload(a.spec);
   const env = { ...process.env, CIRCUIT_AGENT_DATA_DIR: dir, AGENT_NAME: a.name, ...(a.spec?.env || {}) };
+  // Custody is off-box: the operator's machine only ever receives a scoped,
+  // rotating SESSION TOKEN (good for in-policy swaps on this one agent + epoch) —
+  // never the signing key. The signer holds the key and the value can't leave.
+  if (a.signer) {
+    Object.assign(env, {
+      CIRCUIT_SIGNER_URL: a.signer.url,
+      CIRCUIT_AGENT_ID: a.signer.agentId,
+      CIRCUIT_AGENT_EPOCH: String(a.signer.epoch),
+      CIRCUIT_AGENT_SESSION: a.signer.token,
+      CIRCUIT_AGENT_ADDRESS: a.signer.address || '',
+      CIRCUIT_AGENT_PAPER: a.signer.paper === false ? '0' : '1',
+    });
+  }
   const proc = spawn(command, args, { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
   const rec = { proc, name: a.name, dir, logBuf: [], lastSent: 0, startedAt: Date.now() };
   agents.set(a.id, rec);
@@ -107,11 +118,10 @@ function readHealth(rec) {
 async function register() {
   await api('POST', '/v1/nodes/register', {
     nodeId: CFG.nodeId,
-    caps: { cpu: CFG.maxCpu, tee: CFG.tee },
+    caps: { cpu: CFG.maxCpu },
     budget: { maxAgents: CFG.maxAgents, maxCpu: CFG.maxCpu, maxMemoryMb: CFG.maxMemoryMb },
-    custodyMax: CFG.custodyMax,
   });
-  log(`registered as ${CFG.nodeId} (budget ${CFG.maxAgents} agents, ${CFG.maxMemoryMb}MB, tee=${CFG.tee})`);
+  log(`registered as ${CFG.nodeId} (budget ${CFG.maxAgents} agents, ${CFG.maxMemoryMb}MB)`);
 }
 
 async function beat() {

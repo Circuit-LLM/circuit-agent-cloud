@@ -14,12 +14,13 @@
 
 ---
 
-Three zero-dependency Node services that together form the agent cloud:
+Four zero-dependency Node services that together form the agent cloud:
 
 | Component | What it is |
 | --------- | ---------- |
-| **control-plane** | Scheduler + registry + log relay. Nodes poll it; the CLI drives agents through it. The only inbound service. |
-| **node-host** | The operator's worker. Declares a resource budget, runs assigned agents (sandboxed, bounded), forwards health + logs. Polls out only — no inbound port. |
+| **control-plane** | Scheduler + registry + log relay + placement authority. Nodes poll it; the CLI drives agents through it. The only inbound service. |
+| **signer** | Custody. Holds each agent's wallet key **off-box** and signs policy-checked trade intents. The operator's machine never sees the key. Also issues the session lease that enforces **at-most-one** running instance per agent. |
+| **node-host** | The operator's worker. Declares a resource budget, runs assigned agents (sandboxed, bounded), forwards health + logs. Polls out only — no inbound port. Receives only a scoped session token, never a key. |
 | **agentd** | A reference agent workload (self-contained paper trader). Production runs `circuit-agent` the same way — it's just another workload command. |
 
 Driven from the terminal by **[circuit-cli](https://github.com/Circuit-LLM/circuit-cli)** (`circuit agent …`). Full design in the **[spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md)**.
@@ -30,28 +31,57 @@ Driven from the terminal by **[circuit-cli](https://github.com/Circuit-LLM/circu
 ┌── user ──┐  HTTPS   ┌──── control-plane ────┐  poll   ┌── operator ──┐
 │ circuit  │ ───────► │ schedule · registry   │ ◄────── │  node-host   │
 │  agent   │          │ · log relay · failover │         │ runs agentd/ │
-└──────────┘          └────────────────────────┘         │ circuit-agent│
-                                                          └──────────────┘
+└──────────┘          └───────────┬────────────┘         │ circuit-agent│
+                       provision  │ session                └──────┬───────┘
+                       wallet +   │ (epoch+token)        intent +  │ token
+                       policy     ▼                      (no key)  ▼
+                            ┌──────────────┐  sign  ◄───────────────┘
+                            │    signer    │  ──────► signature
+                            │ key off-box  │
+                            └──────────────┘
 ```
 
-A node registers with a **budget**; the control plane bin-packs agents onto nodes that fit; nodes heartbeat and get `start`/`stop` assignments; agents' positions live on-chain so a crashed node's agents **reschedule and resume** elsewhere with nothing lost.
+A node registers with a **budget**; the control plane bin-packs agents onto nodes that fit; nodes heartbeat and get `start`/`stop` assignments. Each agent's signing key is generated and held by the **signer**, never on the operator node — so the agent runs its *brain* on borrowed CPU but can only *trade* by asking custody to sign, within the owner's policy. Positions live on-chain, so a crashed node's agents **reschedule and resume** elsewhere with nothing lost.
+
+## Custody — one mechanism
+
+There are no custody tiers. Every agent uses the **off-box signer**:
+
+- **The key never touches the host.** The signer generates a real Solana (Ed25519) wallet per agent and seals it at rest (AES-256-GCM). The operator that runs the agent only ever receives a **session token** — good for *requesting* in-policy trades, useless for theft.
+- **Funds can't leave through the agent.** The signer's vocabulary is `buy | sell` only — there is no transfer/withdraw verb, so value stays inside the agent wallet. The owner withdraws with their own key; the autonomous path can never move funds out. Worst case for a rogue operator: an in-policy swap, never a drain.
+- **Policy is enforced on every trade** — max SOL per trade, max SOL per day, cooldown, and token allow/deny lists.
+- **At-most-one (the fence).** Each agent has one wallet, so at most one instance may trade it. A session carries a monotonic **epoch**; opening a new one (on reschedule/failover) supersedes the old, so a crashed node's orphaned copy is fenced out — its intents are rejected as stale. Deploy as many *different* agents as you like; each runs in exactly one place.
+
+v1 is one trusted signer (Circuit's, or self-hosted). The same API can later sit behind an MPC or TEE signer with no change to agents or hosts.
 
 ## Run it
 
 No dependencies — pure Node ≥ 18.
 
-**Control plane** (one per network):
+**Signer** (custody — one per network, kept on trusted infra):
 
 ```bash
-PORT=18980 node control-plane/server.js
+PORT=18981 node signer/server.js
+# env: CIRCUIT_SIGNER_DIR, CIRCUIT_SIGNER_MASTER_KEY (32 bytes hex/base64 — back it up),
+#      CIRCUIT_SIGNER_KEY (bearer for the control plane)
+```
+
+**Control plane** (one per network — point it at the signer):
+
+```bash
+PORT=18980 CIRCUIT_SIGNER_URL=http://127.0.0.1:18981 \
+CIRCUIT_SIGNER_PUBLIC_URL=https://signer.circuitllm.xyz \
+node control-plane/server.js
 # env: HOST, NODE_TIMEOUT_MS, CIRCUIT_CLOUD_KEY (shared bearer), CIRCUIT_CLOUD_STATE
 ```
+
+`CIRCUIT_SIGNER_URL` is where the control plane reaches custody; `CIRCUIT_SIGNER_PUBLIC_URL` is the URL handed to workloads (defaults to the same). If unset, custody is disabled and agents run paper-only — fine for a dev/demo, never for live funds.
 
 **Node host** (each operator — opt-in, bounded, revocable):
 
 ```bash
 CONTROL_PLANE=https://agents.circuitllm.xyz \
-NODE_ID=my-node MAX_AGENTS=20 MAX_MEMORY_MB=512 CUSTODY_MAX=3 \
+NODE_ID=my-node MAX_AGENTS=20 MAX_MEMORY_MB=512 \
 node node-host/host.js
 ```
 
@@ -65,15 +95,21 @@ The opt-in controls — set via env or `circuit agent host` — are **off by def
 | ---- | ------- |
 | `MAX_AGENTS` | hard ceiling on hosted agents |
 | `MAX_MEMORY_MB` | per-agent memory cap (best-effort kill on Linux; cgroups in prod) |
-| `CUSTODY_MAX` | max custody risk accepted — `0` key-on-node … `3` TEE/any |
-| `CONFIDENTIAL_TEE=1` | advertise a TEE-capable host |
 | `CONTROL_PLANE` | which network to join |
 
-Lowering the budget or stopping the host **drains** its agents — they reschedule elsewhere.
+Lowering the budget or stopping the host **drains** its agents — they reschedule elsewhere. The operator never holds an agent's key regardless of budget — custody is always off-box.
+
+## Test
+
+```bash
+npm test     # node test/e2e-signer.mjs
+```
+
+End-to-end: provisions an off-box wallet, verifies a real Ed25519 signature against the agent's address, exercises every policy gate and the fence, then stands up the full stack (control plane + 2 node-hosts + signer), proves the key is at the signer and **not** on the control plane, and kills the owning node to confirm the agent **reschedules and the session rotates** (the old node fenced out).
 
 ## Status & roadmap
 
-Alpha. The control plane, node-host, reference workload, scheduling, health/log relay and **crash failover** are working and end-to-end tested. Per the [spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md), next up: custody tiers (Allowance / off-box-MPC / TEE), the CIRC hosting toll through the live distributor, cgroup/container sandboxing, and a Postgres store for HA.
+Alpha, end-to-end tested. Working: control plane, **off-box signer custody**, node-host, reference workload, scheduling, health/log relay, **crash failover**, and the **at-most-one fence**. Per the [spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md), next up: wiring the live on-chain submit seam (build + broadcast the Jupiter swap when `paper=false`), cgroup/container sandboxing, an MPC/TEE signer behind the same API, and a Postgres store for HA.
 
 ## License
 
