@@ -49,7 +49,7 @@ There are no custody tiers. Every agent uses the **off-box signer**:
 
 - **The key never touches the host.** The signer generates a real Solana (Ed25519) wallet per agent and seals it at rest (AES-256-GCM). The operator that runs the agent only ever receives a **session token** — good for *requesting* in-policy trades, useless for theft.
 - **Funds can't leave through the agent.** The signer's vocabulary is `buy | sell` only — there is no transfer/withdraw verb, so value stays inside the agent wallet. The owner withdraws with their own key; the autonomous path can never move funds out. Worst case for a rogue operator: an in-policy swap, never a drain.
-- **Policy is enforced on every trade** — max SOL per trade, max SOL per day, cooldown, and token allow/deny lists.
+- **Policy is enforced on every trade** — max SOL per trade, max SOL per day, cooldown, and token allow/deny lists. On a **live** agent the signer builds the swap *itself* from the approved intent (taker = the agent's own wallet), signs it with the off-box key, and lands it via **Jupiter Ultra** — so it only ever signs a swap of the agent's own funds, never an operator-supplied transaction. Paper agents stop at the signed attestation and never broadcast.
 - **At-most-one (the fence).** Each agent has one wallet, so at most one instance may trade it. A session carries a monotonic **epoch**; opening a new one (on reschedule/failover) supersedes the old, so a crashed node's orphaned copy is fenced out — its intents are rejected as stale. Deploy as many *different* agents as you like; each runs in exactly one place.
 
 v1 is one trusted signer (Circuit's, or self-hosted). The same API can later sit behind an MPC or TEE signer with no change to agents or hosts.
@@ -63,8 +63,11 @@ No dependencies — pure Node ≥ 18.
 ```bash
 PORT=18981 node signer/server.js
 # env: CIRCUIT_SIGNER_DIR, CIRCUIT_SIGNER_MASTER_KEY (32 bytes hex/base64 — back it up),
-#      CIRCUIT_SIGNER_KEY (bearer for the control plane)
+#      CIRCUIT_SIGNER_KEY (bearer for the control plane),
+#      JUPITER_ULTRA_API (paid Ultra key; omit to use the keyless lite-api host)
 ```
+
+Live trades land through **Jupiter Ultra** (it broadcasts, so the signer needs no RPC). An agent trades live only when created with `--live` *and* its wallet is funded; otherwise it's paper.
 
 **Control plane** (one per network — point it at the signer):
 
@@ -105,11 +108,11 @@ Lowering the budget or stopping the host **drains** its agents — they reschedu
 npm test     # node test/e2e-signer.mjs
 ```
 
-End-to-end: provisions an off-box wallet, verifies a real Ed25519 signature against the agent's address, exercises every policy gate and the fence, then stands up the full stack (control plane + 2 node-hosts + signer), proves the key is at the signer and **not** on the control plane, and kills the owning node to confirm the agent **reschedules and the session rotates** (the old node fenced out).
+End-to-end (22 checks): provisions an off-box wallet, verifies a real Ed25519 signature against the agent's address, exercises every policy gate and the fence, stands up the full stack (control plane + 2 node-hosts + signer), proves the key is at the signer and **not** on the control plane, kills the owning node to confirm the agent **reschedules and the session rotates** (the old node fenced out), and drives the **live submit path** (routes on-chain, fails safe, no phantom accounting — without broadcasting). The byte-level transaction signing has its own offline check: `node test/submit-check.mjs`.
 
 ## Status & roadmap
 
-Alpha, end-to-end tested. Working: control plane, **off-box signer custody**, node-host, reference workload, scheduling, health/log relay, **crash failover**, and the **at-most-one fence**. Per the [spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md), next up: wiring the live on-chain submit seam (build + broadcast the Jupiter swap when `paper=false`), cgroup/container sandboxing, an MPC/TEE signer behind the same API, and a Postgres store for HA.
+Alpha, end-to-end tested. Working: control plane, **off-box signer custody**, **live on-chain submit** (Jupiter Ultra, signed with the off-box key), node-host, reference workload, scheduling, health/log relay, **crash failover**, and the **at-most-one fence**. Per the [spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md), next up: cgroup/container sandboxing, an MPC/TEE signer behind the same API, and a Postgres store for HA. A funded mainnet dry-run is the last gate before trusting a live agent with size.
 
 ## License
 

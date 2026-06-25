@@ -28,11 +28,16 @@ import crypto from 'node:crypto';
 import { Router } from '../lib/http.js';
 import { newKeypair, fromSeed, sign, seal, open, sha256hex, randomToken } from '../lib/ed25519.js';
 import { normalizePolicy } from '../lib/proto.js';
+import { executeUltraSwap } from './submit.js';
 
 const PORT = Number(process.env.PORT || 18981);
 const HOST = process.env.HOST || '127.0.0.1';
 const DATA_DIR = process.env.CIRCUIT_SIGNER_DIR || path.join(os.homedir(), '.circuit-signer');
 const KEY = process.env.CIRCUIT_SIGNER_KEY || ''; // bearer for control-plane calls (open if unset)
+// Live trading lands swaps via Jupiter Ultra (it broadcasts, so the signer needs
+// no RPC). lite-api is keyless+rate-limited; set JUPITER_ULTRA_API for the paid host.
+const JUP_BASE = process.env.JUPITER_API_BASE || 'https://lite-api.jup.ag';
+const JUP_KEY = process.env.JUPITER_ULTRA_API || process.env.JUPITER_API_KEY || '';
 
 const log = (...a) => console.log(`[${new Date().toISOString()}] [signer]`, ...a);
 
@@ -167,7 +172,7 @@ r.post('/v1/agents/:id/session', (ctx) => {
 
 // Authorize + sign a trade intent. Auth is the session token itself (scoped to
 // one agent + epoch) — the caller never needs the master/bearer key.
-r.post('/v1/agents/:id/intent', (ctx) => {
+r.post('/v1/agents/:id/intent', async (ctx) => {
   const a = agents[ctx.params.id];
   if (!a) fail(404, 'no-agent', 'no such agent');
   const { epoch, token, intent = {} } = ctx.body;
@@ -191,24 +196,35 @@ r.post('/v1/agents/:id/intent', (ctx) => {
   const sinceLast = Date.now() - (a.lastTradeTs || 0);
   if (sinceLast < a.policy.cooldownMs) fail(429, 'cooldown', `cooldown ${a.policy.cooldownMs - sinceLast}ms remaining`);
 
-  // 3. Sign. The seed is decrypted only for the moment it takes to sign, then wiped.
+  // 3. Sign. The seed is decrypted only for as long as it takes to sign, then wiped.
   const seed = open(MASTER, keys[a.id]);
   const kp = fromSeed(seed);
   const ts = Date.now();
   const canonical = JSON.stringify({ agentId: a.id, epoch, kind, token: intent.token || null, sizeSol: size, ts });
-  const signature = sign(kp.priv, canonical).toString('base64');
-  seed.fill(0); kp.seed.fill(0);
+  const attest = sign(kp.priv, canonical).toString('base64');
 
-  // 4. Account + (paper) record. LIVE SUBMIT SEAM: when policy.paper === false,
-  // build the Jupiter swap tx from `intent`, sign with `kp` (seed‖pubkey is a
-  // Solana secret key) and broadcast via the RPC here, returning the real txid.
-  a.daySpentSol += size; a.lastTradeTs = ts;
-  persist();
-  log(`signed ${a.id} ${kind} ${size} SOL ${intent.token || ''} (epoch ${epoch}, paper=${a.policy.paper})`);
-  return {
-    ok: true, code: 'signed', address: kp.address, signature, paper: a.policy.paper, submitted: false,
-    attestation: { canonical }, daySpentSol: +a.daySpentSol.toFixed(6),
-  };
+  // 4a. PAPER — sign the intent attestation, account, done (no broadcast).
+  if (a.policy.paper) {
+    seed.fill(0); kp.seed.fill(0);
+    a.daySpentSol += size; a.lastTradeTs = ts;
+    persist();
+    log(`signed ${a.id} ${kind} ${size} SOL ${intent.token || ''} (epoch ${epoch}, paper)`);
+    return { ok: true, code: 'signed', address: kp.address, signature: attest, paper: true, submitted: false, attestation: { canonical }, daySpentSol: +a.daySpentSol.toFixed(6) };
+  }
+
+  // 4b. LIVE — build the swap from the intent (taker = this wallet), sign it with
+  // the off-box key, and land it via Ultra. Account ONLY on a confirmed submit.
+  try {
+    const r = await executeUltraSwap({ seed, address: kp.address, intent: { kind, token: intent.token, sizeSol: size, amount: intent.amount, maxSlippageBps: intent.maxSlippageBps }, apiBase: JUP_BASE, apiKey: JUP_KEY });
+    seed.fill(0); kp.seed.fill(0);
+    a.daySpentSol += size; a.lastTradeTs = ts;
+    persist();
+    log(`SUBMITTED ${a.id} ${kind} ${size} SOL ${intent.token} -> ${r.txid} (${r.status})`);
+    return { ok: true, code: 'submitted', address: kp.address, signature: attest, paper: false, submitted: true, txid: r.txid, status: r.status, attestation: { canonical }, daySpentSol: +a.daySpentSol.toFixed(6) };
+  } catch (e) {
+    seed.fill(0); kp.seed.fill(0); // no accounting advance on failure
+    fail(502, 'submit-failed', `live submit failed: ${e.message}`);
+  }
 });
 
 r.delete('/v1/agents/:id', (ctx) => {

@@ -92,6 +92,7 @@ async function main() {
   // ── boot the signer + control plane ──
   start('signer', path.join(REPO, 'signer', 'server.js'), {
     PORT: '18991', HOST: '127.0.0.1', CIRCUIT_SIGNER_DIR: path.join(ROOT, 'signer'), CIRCUIT_SIGNER_MASTER_KEY: MASTER,
+    JUPITER_API_BASE: 'http://127.0.0.1:1', // dead host — exercises the live path without broadcasting
   });
   start('cp', path.join(REPO, 'control-plane', 'server.js'), {
     PORT: '18990', HOST: '127.0.0.1', CIRCUIT_CLOUD_STATE: path.join(ROOT, 'cp', 'state.json'),
@@ -207,6 +208,17 @@ async function main() {
     return (json.lines || []).filter((l) => /agentd up|signed off-box/.test(l.line)).length > 0 && rec.state === 'running';
   }, 30, 500, 'workload resumes on the new node');
   ok(resumed, 'agent resumed on the new node — lossless failover');
+
+  // ════ PART C — live submit path (no broadcast: Jupiter base is a dead host) ════
+  console.log('\nPart C — live submit: routes to on-chain, fails safe, no phantom accounting');
+  const L = 'agt_live_1';
+  await api(SIGNER, 'POST', '/v1/agents', { agentId: L, policy: { maxNotionalSol: 0.05, maxDailySol: 1, cooldownMs: 0, allow: ['buy'], paper: false } });
+  const ls = await api(SIGNER, 'POST', `/v1/agents/${L}/session`, { node: 'nodeX' });
+  const spentBefore = (await api(SIGNER, 'GET', `/v1/agents/${L}`)).json.daySpentSol;
+  const live = await api(SIGNER, 'POST', `/v1/agents/${L}/intent`, { epoch: ls.json.epoch, token: ls.json.token, intent: { kind: 'buy', token: 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v', sizeSol: 0.01 } });
+  ok(live.status === 502 && live.json.code === 'submit-failed', `live intent takes the on-chain path and fails safe [${live.json.code}]`);
+  const spentAfter = (await api(SIGNER, 'GET', `/v1/agents/${L}`)).json.daySpentSol;
+  ok(spentAfter === spentBefore, 'a failed live submit does NOT advance the daily spend (no phantom trade)');
 
   console.log(`\n${fail === 0 ? '✅ ALL GREEN' : '❌ FAILURES'} — ${pass} passed, ${fail} failed`);
   if (fail) dumpLogs();
