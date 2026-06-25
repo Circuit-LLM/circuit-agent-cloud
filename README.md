@@ -20,7 +20,7 @@ Four zero-dependency Node services that together form the agent cloud:
 | --------- | ---------- |
 | **control-plane** | Scheduler + registry + log relay + placement authority. Nodes poll it; the CLI drives agents through it. The only inbound service. |
 | **signer** | Custody. Holds each agent's wallet key **off-box** and signs policy-checked trade intents. The operator's machine never sees the key. Also issues the session lease that enforces **at-most-one** running instance per agent. |
-| **node-host** | The operator's worker. Declares a resource budget, runs assigned agents (sandboxed, bounded), forwards health + logs. Polls out only — no inbound port. Receives only a scoped session token, never a key. |
+| **node-host** | The operator's worker. Declares a resource budget, runs assigned agents (sandboxed, bounded), forwards health + logs. Polls out only — no inbound port. Receives only a scoped session token, never a key. Writes a local `status.json` snapshot so a co-located dashboard (the [circuit-node-client](https://github.com/Circuit-LLM/circuit-node-client) **Cloud** tab) can show what it's hosting. |
 | **agentd** | A reference agent workload (self-contained paper trader). Production runs `circuit-agent` the same way — it's just another workload command. |
 
 Driven from the terminal by **[circuit-cli](https://github.com/Circuit-LLM/circuit-cli)** (`circuit agent …`). Full design in the **[spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md)**.

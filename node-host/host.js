@@ -68,7 +68,7 @@ function startAgent(a) {
     });
   }
   const proc = spawn(command, args, { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
-  const rec = { proc, name: a.name, dir, logBuf: [], lastSent: 0, startedAt: Date.now() };
+  const rec = { proc, name: a.name, workload: a.spec?.workload || 'agentd', dir, logBuf: [], lastSent: 0, startedAt: Date.now() };
   agents.set(a.id, rec);
 
   const onData = (buf) => {
@@ -115,6 +115,25 @@ function readHealth(rec) {
   try { return JSON.parse(fs.readFileSync(path.join(rec.dir, 'heartbeat.json'), 'utf8')); } catch { return null; }
 }
 
+// Write a local snapshot so a co-located dashboard (e.g. circuit-node-client) can
+// show this node's agent-cloud contribution without reaching the control plane.
+function writeStatus() {
+  try {
+    const snapshot = {
+      nodeId: CFG.nodeId,
+      controlPlane: CFG.controlPlane,
+      budget: { maxAgents: CFG.maxAgents, maxMemoryMb: CFG.maxMemoryMb },
+      agents: [...agents.entries()].map(([id, rec]) => ({
+        id, name: rec.name, workload: rec.workload, startedAt: rec.startedAt, health: readHealth(rec),
+      })),
+      updatedAt: Date.now(),
+    };
+    const f = path.join(CFG.dataDir, 'status.json');
+    fs.writeFileSync(f + '.tmp', JSON.stringify(snapshot));
+    fs.renameSync(f + '.tmp', f);
+  } catch {}
+}
+
 async function register() {
   await api('POST', '/v1/nodes/register', {
     nodeId: CFG.nodeId,
@@ -144,11 +163,13 @@ async function beat() {
     rec.lastSent = Date.now();
     api('POST', `/v1/agents/${id}/report`, { health, lines }).catch(() => {});
   }
+  writeStatus();
 }
 
 async function shutdown() {
   log('draining agents…');
   for (const id of [...agents.keys()]) stopAgent(id);
+  writeStatus(); // reflect the drained state for a co-located dashboard
   setTimeout(() => process.exit(0), 2000);
 }
 process.on('SIGINT', shutdown);
