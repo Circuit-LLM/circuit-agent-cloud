@@ -8,8 +8,9 @@
 //   • the order echoes the exact input/output mints and amount we asked for;
 //   • the SOL-denominated value of the swap is within the per-trade + remaining
 //     daily caps (for a sell this is order.outAmount, which `sizeSol` can't bound);
-//   • the transaction's FEE PAYER is the agent, and every program it invokes that
-//     we can resolve from the static account keys is on a swap-only allowlist.
+//   • the agent is a REQUIRED SIGNER (not necessarily the fee payer — RFQ routers
+//     like DFlow sponsor the agent's gas with a relayer fee payer), and every
+//     program it invokes resolvable from the static account keys is allowlisted.
 // Residual trust: programs loaded via v0 address-lookup tables can't be resolved
 // without an RPC round-trip, so full instruction validation against ALTs is the
 // documented final hardening (see SECURITY note at the bottom). Until then live
@@ -199,8 +200,8 @@ export async function executeUltraSwap({ seed, address, intent, apiBase, apiKey,
 
 // SECURITY (live submit) — what bounds an operator/broker today, and what doesn't:
 //   ENFORCED: https-only endpoint · requestId binds the executed tx to our order ·
-//   order mints/amount match our request · fee payer == agent · static-key programs
-//   allowlisted · SOL-value capped per-trade and per-day (sell priced on outAmount).
+//   order mints/amount match our request · agent is a required signer · static-key
+//   programs allowlisted · SOL-value capped per-trade and per-day (sell on outAmount).
 //   RESIDUAL: programs/accounts loaded via v0 address-lookup tables are not resolved
 //   (needs an RPC getAddressLookupTable round-trip) — so a *malicious* Jupiter could
 //   still hide an instruction there. Mitigated by trusting Jupiter over https; full
