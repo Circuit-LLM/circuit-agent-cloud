@@ -28,13 +28,20 @@ const typed = (status, code, message) => Object.assign(new Error(message), { sta
 
 // Programs a Jupiter swap legitimately invokes. Extend via CIRCUIT_SIGNER_EXTRA_PROGRAMS
 // (comma-separated base58) — e.g. after observing real Ultra txs in a funded dry-run.
+// Top-level programs a Jupiter Ultra swap legitimately invokes. NB: Ultra picks a
+// ROUTER per route (Jupiter v6 or an RFQ router like DFlow), and the underlying
+// DEX programs run as inner CPIs that never appear as top-level program ids — so
+// this set stays small. Add a router here as Ultra introduces it (a new router is
+// fail-closed: the signer refuses to sign until it's allowlisted). Both routers
+// below were observed landing real swaps in the funded mainnet dry-run.
 const BASE_PROGRAMS = [
   '11111111111111111111111111111111', // System
   'ComputeBudget111111111111111111111111111111', // ComputeBudget
   'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA', // SPL Token
   'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb', // Token-2022
   'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL', // Associated Token
-  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', // Jupiter Aggregator v6
+  'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4', // Jupiter Aggregator v6 (buy route)
+  'proVF4pMXVaYqmy4NjniPh4pqKNfMmsihgd4wdkCX3u', // DFlow — Ultra RFQ router (sell route)
 ];
 const ALLOWED_PROGRAMS = new Set([
   ...BASE_PROGRAMS,
@@ -104,21 +111,25 @@ async function jpost(url, body, key) {
   return j;
 }
 
-// Inspect a transaction BEFORE signing: the agent must be the fee payer (account
-// index 0), and every program invoked that we can resolve from the static account
-// keys must be swap-only-allowlisted. Returns the program ids we COULDN'T resolve
-// (loaded via address-lookup tables) so the caller can surface the residual.
-// Throws (fail-closed) on a bad fee payer or a disallowed resolvable program.
+// Inspect a transaction BEFORE signing: the agent must be a REQUIRED SIGNER, and
+// every program invoked that we can resolve from the static account keys must be
+// swap-only-allowlisted. (We do NOT require the agent to be the fee payer — Ultra's
+// RFQ routers like DFlow legitimately use a relayer/maker as fee payer and sponsor
+// the agent's gas, with the agent as a non-payer signer.) Returns the program ids
+// we COULDN'T resolve (loaded via address-lookup tables). Throws (fail-closed) on
+// a non-signer agent or a disallowed resolvable program.
 export function inspectTransaction(b64, pubkey) {
   const raw = Buffer.from(b64, 'base64');
   const [sigCount, sigStart] = readCompactU16(raw, 0);
   const m = raw.subarray(sigStart + sigCount * 64);
   let p = (m[0] & 0x80) !== 0 ? 1 : 0; // skip the version byte on v0
+  const numReqSig = m[p];
   p += 3; // header: numReqSig + numReadonlySigned + numReadonlyUnsigned
   const [keyCount, pk] = readCompactU16(m, p); p = pk;
   const staticKeys = [];
   for (let i = 0; i < keyCount; i++) { staticKeys.push(base58(m.subarray(p, p + 32))); p += 32; }
-  if (staticKeys[0] !== base58(pubkey)) throw typed(403, 'tx-rejected', 'transaction fee payer is not the agent wallet');
+  const myIdx = staticKeys.indexOf(base58(pubkey));
+  if (myIdx < 0 || myIdx >= numReqSig) throw typed(403, 'tx-rejected', 'agent wallet is not a required signer of this transaction');
   p += 32; // recent blockhash
   const [ixCount, pi] = readCompactU16(m, p); p = pi;
   const unresolved = [];
@@ -134,7 +145,7 @@ export function inspectTransaction(b64, pubkey) {
       unresolved.push(programIdIndex); // ALT-loaded — not resolvable without RPC
     }
   }
-  return { unresolved };
+  return { unresolved, feePayer: staticKeys[0], signerIndex: myIdx };
 }
 
 // Build → validate → sign → land a swap for an approved intent.

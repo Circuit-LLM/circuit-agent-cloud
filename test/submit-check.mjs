@@ -66,8 +66,8 @@ function extract(signedB64) {
 }
 
 // ── inspectTransaction (the don't-blind-sign gauntlet) ──
-function buildFullTx({ keys, instructions }) {
-  const header = Buffer.from([0x80, 1, 0, 1]); // v0, 1 signer
+function buildFullTx({ numReqSig = 1, keys, instructions }) {
+  const header = Buffer.from([0x80, numReqSig, 0, 1]); // v0
   const keyCount = Buffer.from([keys.length]);
   const blockhash = Buffer.alloc(32, 3);
   const ixCount = Buffer.from([instructions.length]);
@@ -77,31 +77,38 @@ function buildFullTx({ keys, instructions }) {
     Buffer.from([ix.data.length]), ix.data,
   ]));
   const message = Buffer.concat([header, keyCount, Buffer.concat(keys), blockhash, ixCount, ...ixBufs]);
-  return Buffer.concat([Buffer.from([1]), Buffer.alloc(64), message]).toString('base64');
+  return Buffer.concat([Buffer.from([Math.max(1, numReqSig)]), Buffer.alloc(Math.max(1, numReqSig) * 64), message]).toString('base64');
 }
 
-// 5. fee payer = agent, only an allowlisted (Jupiter) program → accepted
+// 5. agent is a signer, only allowlisted programs → accepted
 {
   const agent = newKeypair();
   const tx = buildFullTx({ keys: [agent.pubkey, base58decode(SYSTEM), base58decode(JUP)], instructions: [{ programIdIndex: 2, accounts: [0, 1], data: Buffer.from([9, 9]) }] });
   let okRun = false; try { const r = inspectTransaction(tx, agent.pubkey); okRun = r.unresolved.length === 0; } catch {}
   ok(okRun, 'inspect: accepts a swap whose programs are all allowlisted');
 }
-// 6. fee payer != agent → rejected
+// 6. SPONSORED swap — agent is a non-fee-payer signer (relayer pays), allowlisted → accepted
 {
-  const agent = newKeypair(), stranger = newKeypair();
-  const tx = buildFullTx({ keys: [stranger.pubkey, base58decode(JUP)], instructions: [{ programIdIndex: 1, accounts: [0], data: Buffer.alloc(0) }] });
-  let threw = false; try { inspectTransaction(tx, agent.pubkey); } catch (e) { threw = /fee payer/.test(e.message); }
-  ok(threw, 'inspect: rejects a transaction the agent does not pay for');
+  const relayer = newKeypair(), agent = newKeypair();
+  const tx = buildFullTx({ numReqSig: 2, keys: [relayer.pubkey, agent.pubkey, base58decode(JUP)], instructions: [{ programIdIndex: 2, accounts: [0, 1], data: Buffer.alloc(0) }] });
+  let okRun = false; try { const r = inspectTransaction(tx, agent.pubkey); okRun = r.signerIndex === 1 && r.feePayer === relayer.address; } catch (e) { okRun = false; }
+  ok(okRun, 'inspect: accepts a sponsored swap (relayer fee payer, agent is a signer)');
 }
-// 7. invokes a non-allowlisted program in the static keys → rejected (no blind sign)
+// 7. agent is present but NOT a required signer → rejected
+{
+  const payer = newKeypair(), agent = newKeypair();
+  const tx = buildFullTx({ numReqSig: 1, keys: [payer.pubkey, agent.pubkey, base58decode(JUP)], instructions: [{ programIdIndex: 2, accounts: [0], data: Buffer.alloc(0) }] });
+  let threw = false; try { inspectTransaction(tx, agent.pubkey); } catch (e) { threw = /required signer/.test(e.message); }
+  ok(threw, 'inspect: rejects a transaction where the agent is not a required signer');
+}
+// 8. invokes a non-allowlisted program in the static keys → rejected (no blind sign)
 {
   const agent = newKeypair(), evil = newKeypair();
   const tx = buildFullTx({ keys: [agent.pubkey, evil.pubkey], instructions: [{ programIdIndex: 1, accounts: [0], data: Buffer.from([1]) }] });
   let threw = false; try { inspectTransaction(tx, agent.pubkey); } catch (e) { threw = /non-allowlisted/.test(e.message); }
   ok(threw, 'inspect: refuses a transaction that calls an unknown program');
 }
-// 8. program loaded via an ALT (index past static keys) → surfaced as unresolved, not signed blindly as "ok"
+// 9. program loaded via an ALT (index past static keys) → surfaced as unresolved, not signed blindly
 {
   const agent = newKeypair();
   const tx = buildFullTx({ keys: [agent.pubkey], instructions: [{ programIdIndex: 5, accounts: [0], data: Buffer.alloc(0) }] });

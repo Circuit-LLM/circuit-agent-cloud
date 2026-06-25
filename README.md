@@ -112,7 +112,7 @@ End-to-end (22 checks): provisions an off-box wallet, verifies a real Ed25519 si
 
 ## Status & roadmap
 
-Alpha, end-to-end tested. Working: control plane, **off-box signer custody**, **live on-chain submit** (Jupiter Ultra, signed with the off-box key), node-host, reference workload, scheduling, health/log relay, **crash failover**, and the **at-most-one fence**. Per the [spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md), next up: cgroup/container sandboxing, an MPC/TEE signer behind the same API, and a Postgres store for HA. A funded mainnet dry-run is the last gate before trusting a live agent with size.
+Alpha, end-to-end tested **and proven on mainnet**. Working: control plane, **off-box signer custody**, **live on-chain submit** (Jupiter Ultra, signed with the off-box key) — validated with a real funded round-trip (a buy via Jupiter v6 and a sell via DFlow's sponsored-payer route, both built → validated → off-box-signed → landed) — node-host, reference workload, scheduling, health/log relay, **crash failover**, and the **at-most-one fence**. During that dry-run the pre-sign validation did its job: it fail-closed on an unrecognized router until it was verified and allowlisted. Per the [spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md), next up: full ALT (address-lookup-table) program resolution before unsupervised size, cgroup/container sandboxing, an MPC/TEE signer behind the same API, and a Postgres store for HA.
 
 ## License
 
