@@ -6,3 +6,9 @@ node_modules/
 # runtime state (control-plane store, host data)
 state.json
 *.tmp
+# signer custody material — NEVER commit (defends against CIRCUIT_SIGNER_DIR pointing here)
+master.key
+keys.json
+agents.json
+.circuit-signer/
+.circuit-cloud/
