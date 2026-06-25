@@ -1,0 +1,19 @@
+{
+  "name": "circuit-agent-cloud",
+  "version": "0.1.0",
+  "description": "Decentralized CPU hosting for Circuit agents — control plane, node-host, and a reference agent workload",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "circuit-control-plane": "control-plane/server.js",
+    "circuit-node-host": "node-host/host.js",
+    "circuit-agentd": "agentd/agentd.js"
+  },
+  "scripts": {
+    "control-plane": "node control-plane/server.js",
+    "node-host": "node node-host/host.js"
+  },
+  "engines": { "node": ">=18" },
+  "author": "Circuit LLM <circuitllm@protonmail.com>",
+  "license": "MIT"
+}

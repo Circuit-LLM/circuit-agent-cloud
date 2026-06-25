@@ -1,0 +1,8 @@
+node_modules/
+*.log
+.DS_Store
+.env
+.env.*
+# runtime state (control-plane store, host data)
+state.json
+*.tmp
