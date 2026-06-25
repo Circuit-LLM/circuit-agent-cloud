@@ -182,48 +182,65 @@ r.post('/v1/agents/:id/intent', async (ctx) => {
   if (epoch !== a.session.epoch || sha256hex(String(token || '')) !== a.session.tokenHash)
     fail(403, 'fenced', 'stale or invalid session — another instance holds the lease');
 
-  // 2. Policy. NB: only buy|sell exist — funds can never leave the wallet here.
+  // 2. Policy. Only buy|sell exist — there is no transfer/withdraw verb.
   const kind = intent.kind;
   if (!['buy', 'sell'].includes(kind)) fail(400, 'bad-intent', 'kind must be buy|sell');
   if (!a.policy.allow.includes(kind)) fail(403, 'action-not-allowed', `${kind} not allowed by policy`);
-  const size = Number(intent.sizeSol);
-  if (!(size > 0)) fail(400, 'bad-intent', 'sizeSol must be > 0');
-  if (size > a.policy.maxNotionalSol) fail(403, 'over-trade-cap', `size ${size} > maxNotionalSol ${a.policy.maxNotionalSol}`);
   if (intent.token && a.policy.denyTokens.includes(intent.token)) fail(403, 'token-denied', 'token denied by policy');
   if (intent.token && a.policy.allowTokens && !a.policy.allowTokens.includes(intent.token)) fail(403, 'token-not-allowed', 'token not in allowlist');
-  if (a.day !== utcDay()) { a.day = utcDay(); a.daySpentSol = 0; }
-  if (a.daySpentSol + size > a.policy.maxDailySol) fail(403, 'over-daily-cap', `daily ${a.daySpentSol.toFixed(4)}+${size} > ${a.policy.maxDailySol}`);
   const sinceLast = Date.now() - (a.lastTradeTs || 0);
   if (sinceLast < a.policy.cooldownMs) fail(429, 'cooldown', `cooldown ${a.policy.cooldownMs - sinceLast}ms remaining`);
+  if (a.day !== utcDay()) { a.day = utcDay(); a.daySpentSol = 0; }
+
+  // Notional is SOL-denominated. For a BUY it's exactly sizeSol (SOL in) and is
+  // capped up front. For a live SELL the SOL value is the swap OUTPUT — known only
+  // from the order — so it's enforced inside executeUltraSwap against order.outAmount
+  // (sizeSol can't bound it). In paper, sizeSol is the declared notional for both.
+  const sizeSol = Number(intent.sizeSol);
+  const liveSell = kind === 'sell' && !a.policy.paper;
+  if (!liveSell) {
+    if (!(sizeSol > 0)) fail(400, 'bad-intent', 'sizeSol must be > 0');
+    if (sizeSol > a.policy.maxNotionalSol) fail(403, 'over-trade-cap', `size ${sizeSol} > maxNotionalSol ${a.policy.maxNotionalSol}`);
+    if (a.daySpentSol + sizeSol > a.policy.maxDailySol) fail(403, 'over-daily-cap', `daily ${a.daySpentSol.toFixed(4)}+${sizeSol} > ${a.policy.maxDailySol}`);
+  } else if (!(Number(intent.amount) > 0)) {
+    fail(400, 'bad-intent', 'live sell needs intent.amount in token base units');
+  }
 
   // 3. Sign. The seed is decrypted only for as long as it takes to sign, then wiped.
   const seed = open(MASTER, keys[a.id]);
   const kp = fromSeed(seed);
   const ts = Date.now();
-  const canonical = JSON.stringify({ agentId: a.id, epoch, kind, token: intent.token || null, sizeSol: size, ts });
+  const canonical = JSON.stringify({ agentId: a.id, epoch, kind, token: intent.token || null, sizeSol: sizeSol || null, ts });
   const attest = sign(kp.priv, canonical).toString('base64');
 
   // 4a. PAPER — sign the intent attestation, account, done (no broadcast).
   if (a.policy.paper) {
     seed.fill(0); kp.seed.fill(0);
-    a.daySpentSol += size; a.lastTradeTs = ts;
+    a.daySpentSol += sizeSol; a.lastTradeTs = ts;
     persist();
-    log(`signed ${a.id} ${kind} ${size} SOL ${intent.token || ''} (epoch ${epoch}, paper)`);
+    log(`signed ${a.id} ${kind} ${sizeSol} SOL ${intent.token || ''} (epoch ${epoch}, paper)`);
     return { ok: true, code: 'signed', address: kp.address, signature: attest, paper: true, submitted: false, attestation: { canonical }, daySpentSol: +a.daySpentSol.toFixed(6) };
   }
 
-  // 4b. LIVE — build the swap from the intent (taker = this wallet), sign it with
-  // the off-box key, and land it via Ultra. Account ONLY on a confirmed submit.
+  // 4b. LIVE — build + validate + land the swap via Ultra. The caps are enforced
+  // on the swap's real SOL value (also inside executeUltraSwap, so a live SELL
+  // can't escape them), and we charge the daily budget by that actual value.
+  const remainingDailySol = Math.max(0, a.policy.maxDailySol - a.daySpentSol);
   try {
-    const r = await executeUltraSwap({ seed, address: kp.address, intent: { kind, token: intent.token, sizeSol: size, amount: intent.amount, maxSlippageBps: intent.maxSlippageBps }, apiBase: JUP_BASE, apiKey: JUP_KEY });
+    const r = await executeUltraSwap({
+      seed, address: kp.address,
+      intent: { kind, token: intent.token, sizeSol, amount: intent.amount, maxSlippageBps: intent.maxSlippageBps },
+      apiBase: JUP_BASE, apiKey: JUP_KEY,
+      maxNotionalSol: a.policy.maxNotionalSol, remainingDailySol,
+    });
     seed.fill(0); kp.seed.fill(0);
-    a.daySpentSol += size; a.lastTradeTs = ts;
+    a.daySpentSol += r.solValue; a.lastTradeTs = ts;
     persist();
-    log(`SUBMITTED ${a.id} ${kind} ${size} SOL ${intent.token} -> ${r.txid} (${r.status})`);
-    return { ok: true, code: 'submitted', address: kp.address, signature: attest, paper: false, submitted: true, txid: r.txid, status: r.status, attestation: { canonical }, daySpentSol: +a.daySpentSol.toFixed(6) };
+    log(`SUBMITTED ${a.id} ${kind} ${r.solValue.toFixed(4)} SOL ${intent.token} -> ${r.txid} (${r.status}${r.altPrograms ? `, ${r.altPrograms} ALT-program(s) unverified` : ''})`);
+    return { ok: true, code: 'submitted', address: kp.address, signature: attest, paper: false, submitted: true, txid: r.txid, status: r.status, solValue: +r.solValue.toFixed(6), attestation: { canonical }, daySpentSol: +a.daySpentSol.toFixed(6) };
   } catch (e) {
     seed.fill(0); kp.seed.fill(0); // no accounting advance on failure
-    fail(502, 'submit-failed', `live submit failed: ${e.message}`);
+    fail(e.status || 502, e.code || 'submit-failed', `live submit failed: ${e.message}`);
   }
 });
 
