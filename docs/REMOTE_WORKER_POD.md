@@ -188,24 +188,27 @@ it on the VPS, stop the pod copy. Because identities travel with the node, flipp
 
 ---
 
-## 8. The one thing to verify: how scoring work reaches a node
+## 8. How work reaches a node (traced — it's clean)
 
-Two ways work reaches a worker:
+Two ways work *could* reach a worker:
 
-- **Pull / outbound (the common, NAT-friendly path).** The worker dials out and pulls/streams work — e.g.
-  each node's LLM worker already connects out to `coordinatorUrl` (a remote runpod today). Works through
-  any NAT, zero inbound config. The node-host is purely this model.
-- **Push / inbound.** If the registry at `:18940` **routes** a scoring request *into* a node (data-api →
-  registry → node), that node must be reachable. A RunPod pod can expose a TCP port, so this is solvable,
-  but it's the case to check.
+- **Pull / outbound (the common, NAT-friendly path).** The worker dials out and pulls/streams work. Works
+  through any NAT, zero inbound config.
+- **Push / inbound.** The central server calls *into* a node's port — which would require the node to be
+  reachable (port exposure / NAT relay).
 
-**Action (step 4 above):** after moving the first node, test a circuit-node-scored data-api endpoint.
-- If scoring still works → `:18940` computes/holds it centrally and the node-clients are liveness/mesh
-  participants (announce + heartbeat only). Moving them is purely outbound — done.
-- If scoring breaks → it's routed to nodes. Either expose the node's port on the pod and register that
-  public address, or front it with the NAT relay. Resolve this before moving all six.
+**Traced result: every node-client role is outbound, so moving them is clean.** `:18940` is **pisky-node**.
+Its token endpoints (`routes/token*.js`) compute scoring **centrally** — they call its own services
+(`dex/trending`, `token/metadata`, `oracle/prices` → Helius/DexScreener/Jupiter), never a node-client. The
+node API (`routes/networkNodes.js`) is a pure **registry**: list / announce / ping / map / stats /
+payouts-eligible / ban. So the 6 node-clients are **liveness + payout-eligibility participants** (announce
++ heartbeat **out**), plus an optional **CPU LLM worker** that connects **out** to `coordinatorUrl`. None
+of that is in the data-API's scoring path, and none of it is inbound.
 
-This is the only open question in the migration; everything else is outbound and clean.
+**Therefore:** moving the node-clients off the VPS has **zero impact** on data-API scoring (it stays
+central on pisky-node) and needs **no inbound port**. Step 4's check is now just a sanity confirmation, not
+a gate. The push/inbound case would only ever apply if a *future* feature routes scoring work to nodes —
+not today.
 
 ---
 
