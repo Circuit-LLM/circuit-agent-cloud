@@ -14,7 +14,7 @@
     "control-plane": "node control-plane/server.js",
     "signer": "node signer/server.js",
     "node-host": "node node-host/host.js",
-    "test": "node test/e2e-signer.mjs"
+    "test": "node test/crypto-check.mjs && node test/verified-intent.test.mjs && node test/e2e-signer.mjs"
   },
   "engines": { "node": ">=18" },
   "author": "Circuit LLM <circuitllm@protonmail.com>",

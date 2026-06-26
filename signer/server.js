@@ -27,7 +27,8 @@ import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { Router } from '../lib/http.js';
 import { newKeypair, fromSeed, sign, seal, open, sha256hex, randomToken } from '../lib/ed25519.js';
-import { normalizePolicy } from '../lib/proto.js';
+import { normalizePolicy, normalizeVerified } from '../lib/proto.js';
+import { decisionGate } from '../lib/verified-intent.js';
 import { executeUltraSwap } from './submit.js';
 
 const PORT = Number(process.env.PORT || 18981);
@@ -86,6 +87,17 @@ function persist() {
 const utcDay = () => new Date().toISOString().slice(0, 10);
 const fail = (status, code, error) => { const e = new Error(error); e.status = status; e.code = code; throw e; };
 
+// Replay guard for verified-intent evidence nonces (TTL-swept; bounded). A reused
+// nonce means a host is replaying stale authenticated data to re-justify a trade.
+const _vnonce = new Map();
+const VERIFIED_NONCES = {
+  has: (n) => _vnonce.has(n),
+  add: (n) => {
+    _vnonce.set(n, Date.now());
+    if (_vnonce.size > 5000) for (const [k, t] of _vnonce) if (Date.now() - t > 300000) _vnonce.delete(k);
+  },
+};
+
 function auth(ctx) {
   if (!KEY) return;
   const got = (ctx.req.headers.authorization || '').replace(/^Bearer\s+/i, '');
@@ -102,6 +114,9 @@ function publicView(a) {
     epoch: a.session?.epoch ?? 0,
     hasSession: !!a.session,
     lastTradeTs: a.lastTradeTs || 0,
+    verified: a.verified
+      ? { ruleId: a.verified.rule?.id ?? null, acceptedKeys: Object.keys(a.verified.acceptedKeys).length, requireVerifiedIntent: !!a.policy.requireVerifiedIntent }
+      : null,
   };
 }
 
@@ -114,7 +129,7 @@ r.get('/health', () => ({ ok: true, service: 'circuit-signer', agents: Object.ke
 // generated once and never regenerated, so an agent's address is stable.
 r.post('/v1/agents', (ctx) => {
   auth(ctx);
-  const { agentId, policy } = ctx.body;
+  const { agentId, policy, verified } = ctx.body;
   if (!agentId) fail(400, 'bad-request', 'agentId required');
   let a = agents[agentId];
   if (!a) {
@@ -125,6 +140,7 @@ r.post('/v1/agents', (ctx) => {
       id: agentId,
       address: kp.address,
       policy: normalizePolicy(policy),
+      verified: normalizeVerified(verified),
       day: utcDay(),
       daySpentSol: 0,
       lastTradeTs: 0,
@@ -132,8 +148,9 @@ r.post('/v1/agents', (ctx) => {
       createdAt: Date.now(),
     };
     log(`provisioned ${agentId} -> ${kp.address}`);
-  } else if (policy) {
-    a.policy = normalizePolicy(policy);
+  } else {
+    if (policy) a.policy = normalizePolicy(policy);
+    if (verified) a.verified = normalizeVerified(verified);
   }
   persist();
   return publicView(a);
@@ -151,6 +168,7 @@ r.put('/v1/agents/:id/policy', (ctx) => {
   const a = agents[ctx.params.id];
   if (!a) fail(404, 'no-agent', 'no such agent');
   a.policy = normalizePolicy(ctx.body.policy);
+  if (ctx.body.verified) a.verified = normalizeVerified(ctx.body.verified);
   persist();
   return publicView(a);
 });
@@ -181,6 +199,28 @@ r.post('/v1/agents/:id/intent', async (ctx) => {
   if (!a.session) fail(403, 'fenced', 'no active session');
   if (epoch !== a.session.epoch || sha256hex(String(token || '')) !== a.session.tokenHash)
     fail(403, 'fenced', 'stale or invalid session — another instance holds the lease');
+
+  // 1b. Verified-intent gate (docs/VERIFIED_INTENTS.md). The fence proves WHO is asking;
+  // it can't prove the trade is honest, because the agent runs on the host's CPU and the
+  // host could pick any in-policy buy/sell. So when the owner has committed a decision
+  // rule, the signer re-derives the trade here: it accepts only if the rule, run on
+  // AUTHENTICATED inputs (signed quotes / inference receipts / zkTLS), produces this exact
+  // intent. A forged or unjustified trade is rejected before any signing. Opt-in: agents
+  // without requireVerifiedIntent are unaffected (deterrence/TEE handle opaque strategies).
+  if (a.policy.requireVerifiedIntent) {
+    if (!a.verified?.rule) fail(409, 'no-rule', 'requireVerifiedIntent set but no committed rule');
+    const g = decisionGate(
+      { intent, rule: ctx.body.rule, inputs: ctx.body.inputs || {}, evidence: ctx.body.evidence || [] },
+      {
+        rule: a.verified.rule,
+        acceptedKeys: a.verified.acceptedKeys,
+        acceptedNotaries: a.verified.acceptedNotaries,
+        maxAgeMs: a.verified.evidenceMaxAgeMs,
+        replay: VERIFIED_NONCES,
+      },
+    );
+    if (!g.ok) fail(403, g.code, `verified-intent rejected: ${g.code}`);
+  }
 
   // 2. Policy. Only buy|sell exist — there is no transfer/withdraw verb.
   const kind = intent.kind;
