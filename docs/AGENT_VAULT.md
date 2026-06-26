@@ -295,9 +295,11 @@ prod. Audit is the gate before *other people's* money; not needed for devnet or 
 ## 10. Decisions (ADR-0 — locked)
 
 1. **Vault model: one vault PER AGENT.** ✅ Cleanest isolation, simplest accounting, smallest blast radius.
-2. **Route policy: ANY program, guard-only.** ✅ No CPI allowlist — maximal flexibility (any DEX/router).
-   *Consequence:* the guard is the sole boundary and MUST enforce the full post-state invariant (§5b:
-   authority/delegate/ownership, not just balances). This raises the audit bar; accepted deliberately.
+2. **Route policy: ANY program by default, with an OPTIONAL owner-set allowlist.** ✅ The guard enforces
+   the full post-state invariant (§5b) regardless of route — so extraction is impossible either way. On
+   top of that, `set_routes` lets a cautious owner restrict a vault to audited routers (e.g. Jupiter), so
+   the guard isn't the *sole* boundary (defense in depth). Empty allowlist = any program (the default).
+   *Resolution of the earlier any-program-only concern: the owner now chooses their risk posture.*
 3. **Verified Intents on-chain: IN v1.** ✅ Phase 4 ships in the first build — the program enforces the
    committed rule + signed evidence, so the chain refuses even *griefing* (off-rule) trades, not just theft.
 4. **Delegate key:** host-held + owner-rotatable (it's powerless, so leakage ≠ loss).
