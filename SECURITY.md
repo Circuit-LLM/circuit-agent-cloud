@@ -25,9 +25,11 @@ never by the node that runs the agent.
   (a live sell is priced on the SOL it returns, so it can't slip the caps),
   cooldown, and token allow/deny lists.
 
-Custody guarantees **no drain**. It does *not*, by itself, stop a hostile host from
-submitting an *in-policy* `buy`/`sell` **of its own choosing** — the agent runs on the
-host's CPU, so the host can drive it. There are **two roads** to close that gap.
+Custody guarantees **no drain**. On its own it bounds a hostile host to an *in-policy*
+`buy`/`sell` — but since the agent runs on the host's CPU, *which* in-policy trade fires is
+the host's to pick until you close it. **Verified Intents** closes it in software (any CPU);
+**Sealed Agents** closes it in hardware (any strategy). Both below — for a trading agent,
+Verified Intents is the one to reach for.
 
 ## Verified Intents — closing trade forgery in software (any CPU)
 
