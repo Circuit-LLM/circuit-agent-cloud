@@ -126,31 +126,49 @@ trade(route_data, accounts, amount_in, min_out):
   before_out = balance(vault_output_ata)
   before_sol = lamports(vault)                             // minus expected fee budget
 
-  // 3. execute the swap — invoke_signed with the vault PDA as authority
-  require route_program ∈ {JUPITER_V6}                     // CPI target allowlist — PDA can't sign for arbitrary programs
+  // 3. snapshot the FULL state of every vault-owned account (not just balances — see ADR-0:
+  //    route policy = ANY program, so the guard is the sole boundary and must catch authority
+  //    grants, not only balance moves).
+  for acct in vault_owned_accounts:
+    snapshot[acct] = { amount, delegate, owner/close_authority, owner_program }
+
+  // 4. execute the swap — invoke_signed with the vault PDA as authority. ANY program allowed
+  //    (no CPI allowlist) — the guard below is what makes that safe.
   invoke_signed(route_program, accounts, route_data, &[vault_seeds])
 
-  // 4. THE GUARD — assert value stayed in the vault
-  after_in  = balance(vault_input_ata)
-  after_out = balance(vault_output_ata)
+  // 5. THE GUARD — assert value AND authority stayed in the vault
+  // 5a. value
   require before_in - after_in  <= amount_in               // spent no more than authorized
-  require after_out - before_out >= min_out                // received at least min_out  ← the anti-theft line
-  require no other vault-owned ATA was touched             // only the declared input/output moved
+  require after_out - before_out >= min_out                // received at least min_out  ← anti-theft line
+  require every other vault ATA's amount unchanged          // only the declared input/output moved
   require lamports(vault) >= before_sol - max_fee          // SOL didn't walk out as "fees"
+  // 5b. authority (REQUIRED because any program is allowed — catches the no-balance-change attacks)
+  require every vault ATA.delegate == None (or unchanged)   // no `approve` granted → no future drain
+  require every vault ATA.owner/close_authority == vault PDA // no `setAuthority` handoff
+  require every vault account.owner_program unchanged        // not reassigned / closed out from under us
+  require vault PDA still owned by THIS program
 
-  // 5. account
+  // 6. account
   day_spent += (before_in - after_in); last_trade_ts = now
 ```
 
 **Why this is safe, plainly:**
 - The program **controls which accounts** the swap uses — it passes the vault's *own* input and output
   ATAs. The delegate cannot point the output at its own wallet; the program does.
-- The CPI target is **allowlisted to a swap router** (Jupiter), so the delegate can't use the vault's
-  signature to invoke a transfer program directly.
-- The **post-condition is the real lock:** output must increase by `min_out`. If value left the vault
-  without coming back (the definition of theft), `after_out - before_out >= min_out` fails and the **entire
-  transaction reverts.** Whatever happened between snapshot and check is irrelevant — if the vault isn't
-  richer-or-equal in the way a swap should leave it, nothing happened.
+- **Any swap program is allowed** (ADR-0), so there is *no* CPI allowlist — the **guard is the entire
+  defense.** That's why §5b is mandatory: a pure balance check would miss `approve`/`setAuthority`
+  (instructions that grant *future* control without moving a balance now). The guard re-validates the full
+  post-state of every vault account — balances **and** delegate/authority/ownership — so the only thing the
+  delegate can leave behind is "same accounts, same authorities, value swapped within caps."
+- The **post-condition is the real lock:** output must increase by `min_out`, nothing else may move, and no
+  authority may change. If anything else happened, the **entire transaction reverts.** Whatever ran between
+  snapshot and check is irrelevant — if the vault isn't in exactly the shape a fair swap leaves it, nothing
+  happened.
+
+> **ADR-0 security note (any-program route policy):** allowing any CPI target maximizes flexibility (any
+> DEX/router, today and future) but makes the guard the sole boundary and widens the audit surface. The
+> §5b authority checks are non-negotiable under this policy. The adversarial test suite must explicitly
+> include `approve`, `setAuthority`, `closeAccount`, and reassign attempts — not just balance drains.
 
 So the delegate can do exactly one thing with the vault's money: **turn token A into a fair amount of token
 B, inside the vault.** It cannot take A, cannot redirect B, cannot drain SOL. That is non-custodial trading
@@ -274,18 +292,21 @@ prod. Audit is the gate before *other people's* money; not needed for devnet or 
 
 ---
 
-## 10. Open decisions (resolve in Phase 0 as ADRs)
+## 10. Decisions (ADR-0 — locked)
 
-1. **One vault per agent vs. one vault, many agents (sub-accounts).** Per-agent is simplest + cleanest
-   isolation; sub-accounts save rent. Lean per-agent for v1.
-2. **Delegate key location** — on the agent host (simple, powerless) vs. rotated each placement (tighter).
-   Lean host-held + owner-rotatable, since it's powerless.
-3. **Jupiter integration depth** — full CPI vs. a constrained set of DEXes. Lean Jupiter CPI for "trade
-   anything," accept the integration cost.
-4. **Verified Intents on-chain in v1 or fast-follow.** Lean fast-follow (Phase 4) so custody ships first.
-5. **Upgrade authority governance** — multisig now; path to immutable post-audit.
-6. **Repo** — `programs/agent-vault` inside circuit-agent-cloud vs. its own repo. Lean a dedicated repo
-   (`circuit-agent-vault`) since it's an independently-auditable artifact.
+1. **Vault model: one vault PER AGENT.** ✅ Cleanest isolation, simplest accounting, smallest blast radius.
+2. **Route policy: ANY program, guard-only.** ✅ No CPI allowlist — maximal flexibility (any DEX/router).
+   *Consequence:* the guard is the sole boundary and MUST enforce the full post-state invariant (§5b:
+   authority/delegate/ownership, not just balances). This raises the audit bar; accepted deliberately.
+3. **Verified Intents on-chain: IN v1.** ✅ Phase 4 ships in the first build — the program enforces the
+   committed rule + signed evidence, so the chain refuses even *griefing* (off-rule) trades, not just theft.
+4. **Delegate key:** host-held + owner-rotatable (it's powerless, so leakage ≠ loss).
+5. **Upgrade authority:** multisig at deploy; path to immutable post-audit.
+6. **Repo:** dedicated `circuit-agent-vault` (independently-auditable artifact) with the program + the
+   off-chain client.
+
+Open items still to settle during the build: exact wSOL wrap/unwrap flow, Token-2022 fee-extension
+handling, and the Rust port of the rule evaluator for Phase 4.
 
 ---
 
