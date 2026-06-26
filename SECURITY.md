@@ -16,11 +16,26 @@ never by the node that runs the agent.
 - **The operator gets a token, not a key.** A node-host receives a short-lived,
   rotating **session token** scoped to one agent + epoch. It authorizes
   *requesting* in-policy trades; it cannot move funds.
-- **Funds can't leave through the agent.** The signer's intent vocabulary is
-  `buy | sell` only — there is **no transfer/withdraw verb**. Value stays inside
-  the agent wallet. The owner withdraws with their own key; the autonomous path
-  can never send funds to an arbitrary address. Worst case for a malicious
-  operator (or a leaked session token): an *in-policy swap*, never a drain.
+- **The autonomous path can't move funds out.** The agent/host trade vocabulary is
+  `buy | sell` only — no transfer/withdraw. So the worst a hostile host or a leaked
+  session token can do is an *in-policy swap*; it can never send funds to an arbitrary
+  address.
+- **The owner gets funds back (owner-gated, not the autonomous path).** Two routes,
+  neither reachable by the host or a session token:
+  - **`withdraw`** sends the wallet's SOL to the agent's **committed owner address only**
+    (set at create / via the owner route) — never an arbitrary destination, so it's not a
+    drain vector. The owner skims or fully recovers without exposing the key.
+  - **`export`** hands the owner the wallet's private key to take full self-custody. After
+    export the off-box guarantee no longer holds for that wallet (the key now exists
+    elsewhere) — a deliberate owner choice.
+  - **`destroy` fails closed on a non-empty wallet** (the key-wipe is irreversible), telling
+    you to withdraw/export first; `force` overrides to abandon remaining funds.
+- **Custodial reality (v1, be honest about it).** Today `withdraw`/`export`/`destroy` are
+  gated by the **operator bearer key**, and the operator holds the master key + sealed
+  seeds — so the signer is a **custodian of the agent trading wallets**. The host can't
+  steal, but a compromised signer host or a malicious operator could. A **multi-tenant**
+  deployment must add **per-owner authentication** in front of these owner actions (and
+  ideally move to the non-custodial path below) before holding other people's funds.
 - **Policy is enforced on every trade** — max SOL per trade, max SOL per day
   (a live sell is priced on the SOL it returns, so it can't slip the caps),
   cooldown, and token allow/deny lists.

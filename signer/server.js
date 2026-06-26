@@ -7,11 +7,14 @@
 // token T"; the signer checks it against the owner's policy and signs the trade.
 //
 // What this buys, in one service:
-//   1. CUSTODY — the operator can never steal funds: the key isn't on their box.
-//      The worst a malicious operator (or a leaked session token) can do is make
-//      the agent place an *in-policy swap* — value stays inside the agent wallet.
-//      There is no 'transfer'/'withdraw' verb here at all, so funds can't leave;
-//      withdrawals are done by the owner with their own key, never autonomously.
+//   1. CUSTODY — the operator/host can never steal funds: the key isn't on their box,
+//      and the AUTONOMOUS path is buy/sell-only (no transfer/withdraw), so the worst a
+//      malicious host or a leaked session token can do is an *in-policy swap*. The OWNER
+//      gets funds back two ways, both owner-gated (not the autonomous path): `withdraw`
+//      sends SOL to the agent's committed owner address ONLY (never arbitrary), and
+//      `export` hands the owner the wallet's private key to take full custody. NOTE: in
+//      v1 these are gated by the operator bearer — a true multi-tenant deployment must add
+//      per-owner auth, since the signer is otherwise a custodian of the agent wallets.
 //   2. THE FENCE (at-most-one) — each agent has ONE wallet, so at most one live
 //      instance may trade it. A session carries a monotonic epoch + secret token;
 //      opening a new session (on reschedule/failover) supersedes the old one, so
@@ -26,15 +29,20 @@ import path from 'node:path';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import { Router } from '../lib/http.js';
-import { newKeypair, fromSeed, sign, seal, open, sha256hex, randomToken } from '../lib/ed25519.js';
+import { newKeypair, fromSeed, sign, seal, open, sha256hex, randomToken, base58, base58decode } from '../lib/ed25519.js';
 import { normalizePolicy, normalizeVerified } from '../lib/proto.js';
 import { decisionGate } from '../lib/verified-intent.js';
 import { executeUltraSwap } from './submit.js';
+import { withdrawSol, getBalanceLamports, hasTokenBalance } from './withdraw.js';
 
 const PORT = Number(process.env.PORT || 18981);
 const HOST = process.env.HOST || '127.0.0.1';
 const DATA_DIR = process.env.CIRCUIT_SIGNER_DIR || path.join(os.homedir(), '.circuit-signer');
 const KEY = process.env.CIRCUIT_SIGNER_KEY || ''; // bearer for control-plane calls (open if unset)
+// RPC for owner-recovery transfers (withdraw / safe-destroy balance checks). Swaps still go
+// through Jupiter Ultra; this is only the System-transfer path back to the owner.
+const RPC = process.env.CIRCUIT_SIGNER_RPC_URL || process.env.CIRCUIT_RPC_URL || 'https://api.mainnet-beta.solana.com';
+const isPubkey = (s) => { try { return typeof s === 'string' && base58decode(s).length === 32; } catch { return false; } };
 // Live trading lands swaps via Jupiter Ultra (it broadcasts, so the signer needs
 // no RPC). lite-api is keyless+rate-limited; set JUPITER_ULTRA_API for the paid host.
 const JUP_BASE = process.env.JUPITER_API_BASE || 'https://lite-api.jup.ag';
@@ -114,6 +122,7 @@ function publicView(a) {
     epoch: a.session?.epoch ?? 0,
     hasSession: !!a.session,
     lastTradeTs: a.lastTradeTs || 0,
+    owner: a.owner || null,
     verified: a.verified
       ? { ruleId: a.verified.rule?.id ?? null, acceptedKeys: Object.keys(a.verified.acceptedKeys).length, requireVerifiedIntent: !!a.policy.requireVerifiedIntent }
       : null,
@@ -129,8 +138,11 @@ r.get('/health', () => ({ ok: true, service: 'circuit-signer', agents: Object.ke
 // generated once and never regenerated, so an agent's address is stable.
 r.post('/v1/agents', (ctx) => {
   auth(ctx);
-  const { agentId, policy, verified } = ctx.body;
+  const { agentId, policy, verified, owner } = ctx.body;
   if (!agentId) fail(400, 'bad-request', 'agentId required');
+  // The owner address is where funds can be withdrawn back to (the ONLY withdraw
+  // destination — never arbitrary). Optional at create, settable later via the owner route.
+  if (owner != null && !isPubkey(owner)) fail(400, 'bad-owner', 'owner must be a base58 pubkey');
   let a = agents[agentId];
   if (!a) {
     const kp = newKeypair();
@@ -139,6 +151,7 @@ r.post('/v1/agents', (ctx) => {
     a = agents[agentId] = {
       id: agentId,
       address: kp.address,
+      owner: owner || null,
       policy: normalizePolicy(policy),
       verified: normalizeVerified(verified),
       day: utcDay(),
@@ -147,10 +160,11 @@ r.post('/v1/agents', (ctx) => {
       session: null,
       createdAt: Date.now(),
     };
-    log(`provisioned ${agentId} -> ${kp.address}`);
+    log(`provisioned ${agentId} -> ${kp.address}${owner ? ` (owner ${owner})` : ''}`);
   } else {
     if (policy) a.policy = normalizePolicy(policy);
     if (verified) a.verified = normalizeVerified(verified);
+    if (owner) a.owner = owner;
   }
   persist();
   return publicView(a);
@@ -171,6 +185,60 @@ r.put('/v1/agents/:id/policy', (ctx) => {
   if (ctx.body.verified) a.verified = normalizeVerified(ctx.body.verified);
   persist();
   return publicView(a);
+});
+
+// Set/replace the owner withdraw address (the only destination withdrawals can reach).
+r.put('/v1/agents/:id/owner', (ctx) => {
+  auth(ctx);
+  const a = agents[ctx.params.id];
+  if (!a) fail(404, 'no-agent', 'no such agent');
+  if (!isPubkey(ctx.body.owner)) fail(400, 'bad-owner', 'owner must be a base58 pubkey');
+  a.owner = ctx.body.owner;
+  persist();
+  log(`owner set ${a.id} -> ${a.owner}`);
+  return publicView(a);
+});
+
+// OWNER WITHDRAW (docs: SECURITY.md). Send the agent wallet's SOL back to the committed
+// owner address — and ONLY that address. This is the owner's escape hatch; the autonomous
+// path stays buy/sell-only. body: { amountSol? } (omit → full sweep minus fee). Bearer-gated
+// (operator); a multi-tenant deployment must add per-owner auth in front of this.
+r.post('/v1/agents/:id/withdraw', async (ctx) => {
+  auth(ctx);
+  const a = agents[ctx.params.id];
+  if (!a) fail(404, 'no-agent', 'no such agent');
+  if (!a.owner) fail(409, 'no-owner', 'no owner address on file — set one before withdrawing');
+  const lamports = ctx.body.amountSol != null ? Math.round(Number(ctx.body.amountSol) * 1e9) : null;
+  if (lamports != null && !(lamports > 0)) fail(400, 'bad-amount', 'amountSol must be > 0');
+  const seed = open(MASTER, keys[a.id]);
+  try {
+    const r2 = await withdrawSol({ url: RPC, seed, fromB58: a.address, ownerB58: a.owner, lamports });
+    log(`WITHDRAW ${a.id} ${(Number(r2.lamports) / 1e9).toFixed(6)} SOL -> owner ${a.owner} (${r2.signature})`);
+    return { ok: true, code: 'withdrawn', signature: r2.signature, owner: a.owner, lamports: r2.lamports, remaining: r2.remaining };
+  } catch (e) {
+    fail(e.status || 502, e.code || 'withdraw-failed', `withdraw failed: ${e.message}`);
+  } finally {
+    seed.fill(0);
+  }
+});
+
+// OWNER KEY EXPORT. Returns the agent wallet's secret key so the owner can take full
+// custody (import into any wallet). This INTENTIONALLY hands out the key — after export the
+// off-box "can't be stolen" guarantee no longer holds for this wallet, so it's a deliberate
+// owner action behind the operator bearer. The agent should be stopped first.
+r.post('/v1/agents/:id/export', (ctx) => {
+  auth(ctx);
+  const a = agents[ctx.params.id];
+  if (!a) fail(404, 'no-agent', 'no such agent');
+  const seed = open(MASTER, keys[a.id]);
+  try {
+    const { pubkey } = fromSeed(seed);
+    const secretKey = Buffer.concat([Buffer.from(seed), pubkey]); // 64-byte Solana secret key
+    log(`EXPORTED key for ${a.id} (${a.address}) — owner took custody`);
+    return { ok: true, address: a.address, seedHex: Buffer.from(seed).toString('hex'), secretKeyBase58: base58(secretKey) };
+  } finally {
+    seed.fill(0);
+  }
 });
 
 // Open (rotate) the agent's session — THE FENCE. Returns a fresh epoch + token;
@@ -284,14 +352,31 @@ r.post('/v1/agents/:id/intent', async (ctx) => {
   }
 });
 
-r.delete('/v1/agents/:id', (ctx) => {
+// Destroy wipes the wallet key — which is IRREVERSIBLE: any funds left in the wallet become
+// permanently unrecoverable. So we fail closed on a non-empty wallet (SOL above the fee
+// reserve, or any token balance) and tell the caller to withdraw/export first. `force:true`
+// overrides for a knowingly-empty wallet or an accepted loss. RPC-unreachable also fails
+// closed (we can't prove it's empty) unless forced.
+r.delete('/v1/agents/:id', async (ctx) => {
   auth(ctx);
   const a = agents[ctx.params.id];
   if (!a) fail(404, 'no-agent', 'no such agent');
+  const force = ctx.body?.force === true || ctx.query?.force === '1';
+  if (!force) {
+    let bal, tokens;
+    try {
+      bal = await getBalanceLamports(RPC, a.address);
+      tokens = await hasTokenBalance(RPC, a.address);
+    } catch (e) {
+      fail(503, 'balance-unreadable', `cannot verify the wallet is empty (${e.message}) — withdraw/export then retry, or use force`);
+    }
+    if (bal > 10000n || tokens)
+      fail(409, 'not-empty', `wallet still holds ${(Number(bal) / 1e9).toFixed(6)} SOL${tokens ? ' + token balance' : ''} — withdraw or export first (or force to abandon it)`);
+  }
   delete agents[ctx.params.id];
   delete keys[ctx.params.id];
   persist();
-  log(`destroyed ${ctx.params.id} (wallet key wiped)`);
+  log(`destroyed ${ctx.params.id} (wallet key wiped${force ? ', forced' : ', verified empty'})`);
   return { ok: true };
 });
 

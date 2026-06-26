@@ -27,15 +27,16 @@ const store = new Store(STATE_FILE);
 
 const log = (...a) => console.log(`[${new Date().toISOString()}] [cp]`, ...a);
 
-async function signerApi(method, p, body) {
+async function signerApi(method, p, body, timeoutMs = 8000) {
   const r = await fetch(SIGNER_URL + p, {
     method,
     headers: { 'Content-Type': 'application/json', ...(SIGNER_KEY ? { Authorization: `Bearer ${SIGNER_KEY}` } : {}) },
     body: body ? JSON.stringify(body) : undefined,
-    signal: AbortSignal.timeout(8000),
+    signal: AbortSignal.timeout(timeoutMs),
   });
-  if (!r.ok) { const e = new Error(`signer ${p} -> ${r.status}`); e.status = r.status; throw e; }
-  return r.json();
+  const j = await r.json().catch(() => ({}));
+  if (!r.ok) { const e = new Error(j.error || `signer ${p} -> ${r.status}`); e.status = r.status; e.code = j.code; throw e; }
+  return j;
 }
 
 // Open a fresh session for the agent's current placement when it changes nodes.
@@ -219,7 +220,7 @@ r.post('/v1/agents', async (ctx) => {
   // is generated and kept there — the control plane only ever learns the address.
   if (SIGNER_URL) {
     try {
-      const s = await signerApi('POST', '/v1/agents', { agentId: agent.id, policy: agent.policy, ...(agent.verified ? { verified: agent.verified } : {}) });
+      const s = await signerApi('POST', '/v1/agents', { agentId: agent.id, policy: agent.policy, ...(agent.verified ? { verified: agent.verified } : {}), ...(agent.owner ? { owner: agent.owner } : {}) });
       agent.address = s.address;
       agent.paper = s.policy?.paper !== false;
     } catch (e) {
@@ -257,11 +258,39 @@ r.delete('/v1/agents/:id', async (ctx) => {
   auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
-  // Mark stopped so the host drains it; orphan-stop cleans the node next beat.
-  store.deleteAgent(a.id);
-  if (SIGNER_URL) await signerApi('DELETE', `/v1/agents/${a.id}`).catch((e) => log(`signer wipe failed ${a.id}: ${e.message}`));
+  // Destroy the off-box wallet FIRST. The signer fails closed on a non-empty wallet
+  // (key-wipe is irreversible) — so if it refuses, surface that and DON'T delete the
+  // control-plane record. `?force=1` overrides (abandons any remaining funds).
+  if (SIGNER_URL) {
+    const q = ctx.query?.force === '1' ? '?force=1' : '';
+    await signerApi('DELETE', `/v1/agents/${a.id}${q}`);
+  }
+  store.deleteAgent(a.id); // host drains it; orphan-stop cleans the node next beat
   log(`agent destroyed ${a.id}`);
   return { ok: true };
+});
+
+// Owner-recovery proxies → the signer (custody). The control plane never sees the key.
+r.put('/v1/agents/:id/owner', async (ctx) => {
+  auth(ctx);
+  const a = store.getAgent(ctx.params.id);
+  if (!a) throw new Error('no such agent');
+  a.owner = ctx.body.owner;
+  const s = await signerApi('PUT', `/v1/agents/${a.id}/owner`, { owner: ctx.body.owner });
+  store.putAgent(a);
+  return { agent: a, signer: s };
+});
+r.post('/v1/agents/:id/withdraw', async (ctx) => {
+  auth(ctx);
+  const a = store.getAgent(ctx.params.id);
+  if (!a) throw new Error('no such agent');
+  return signerApi('POST', `/v1/agents/${a.id}/withdraw`, { amountSol: ctx.body.amountSol }, 45000); // confirm can take ~30s
+});
+r.post('/v1/agents/:id/export', async (ctx) => {
+  auth(ctx);
+  const a = store.getAgent(ctx.params.id);
+  if (!a) throw new Error('no such agent');
+  return signerApi('POST', `/v1/agents/${a.id}/export`, {});
 });
 
 r.get('/v1/agents/:id', (ctx) => {
