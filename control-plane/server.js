@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { Router, sendJson } from '../lib/http.js';
 import { Store } from '../lib/store.js';
-import { STATE, nodeSatisfies, normalizePolicy, newId, now } from '../lib/proto.js';
+import { STATE, nodeSatisfies, normalizePolicy, normalizeVerified, newId, now } from '../lib/proto.js';
 
 const PORT = Number(process.env.PORT || 18980);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -195,7 +195,7 @@ r.post('/v1/agents/:id/report', (ctx) => {
 // ── Agent CRUD (CLI side) ──
 r.post('/v1/agents', async (ctx) => {
   auth(ctx);
-  const { name, owner, spec = {}, policy } = ctx.body;
+  const { name, owner, spec = {}, policy, verified } = ctx.body;
   if (!name) throw new Error('name required');
   const agent = {
     id: newId('agt'),
@@ -204,6 +204,9 @@ r.post('/v1/agents', async (ctx) => {
     spec,
     custody: 'offbox-signer',
     policy: normalizePolicy(policy),
+    // Verified-intent config (docs/VERIFIED_INTENTS.md) — forwarded to the signer, which
+    // re-runs the committed rule on authenticated inputs before signing a trade.
+    verified: verified ? normalizeVerified(verified) : null,
     address: null, // filled by the signer below
     desired: 'stopped',
     state: STATE.PENDING,
@@ -216,7 +219,7 @@ r.post('/v1/agents', async (ctx) => {
   // is generated and kept there — the control plane only ever learns the address.
   if (SIGNER_URL) {
     try {
-      const s = await signerApi('POST', '/v1/agents', { agentId: agent.id, policy: agent.policy });
+      const s = await signerApi('POST', '/v1/agents', { agentId: agent.id, policy: agent.policy, ...(agent.verified ? { verified: agent.verified } : {}) });
       agent.address = s.address;
       agent.paper = s.policy?.paper !== false;
     } catch (e) {
