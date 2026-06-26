@@ -25,6 +25,49 @@ never by the node that runs the agent.
   (a live sell is priced on the SOL it returns, so it can't slip the caps),
   cooldown, and token allow/deny lists.
 
+Custody guarantees **no drain**. It does *not*, by itself, stop a hostile host from
+submitting an *in-policy* `buy`/`sell` **of its own choosing** — the agent runs on the
+host's CPU, so the host can drive it. There are **two roads** to close that gap.
+
+## Verified Intents — closing trade forgery in software (any CPU)
+
+*Validate, don't isolate.* The owner commits a **decision rule** (`rule(inputs) → buy/sell`)
+and the producer keys it trusts. With `requireVerifiedIntent` set, the signer signs a trade
+only if — beyond the fence + policy — the trade is the genuine output of that rule on
+**authenticated inputs**:
+
+```
+fence (epoch + token)            ── who is asking
+for each evidence:  verify signature/proof + freshness + unused nonce
+bind intent.inputs == the values the evidence proves
+re-run rule(inputs)  →  must equal the submitted intent      ── the decision gate
+policy caps (notional/daily/cooldown/allow)
+sign  ── only now
+```
+
+Evidence is **first-party signed data** (`circuit-data-api ?signed=1`), a **signed inference
+receipt** (the DLLM gateway, turning an AI verdict into a checkable input), or a **zkTLS proof**
+(third-party data). A host that forges a trade, fakes the data, or replays a stale-but-real
+quote is rejected before signing — `decision-unjustified` / `evidence-invalid` /
+`evidence-stale` / `input-mismatch`. Implemented in `lib/verified-intent.js` (a byte-identical
+port of `@circuit/attest`), enforced in `signer/server.js`. Full spec + threat model:
+[docs/VERIFIED_INTENTS.md](docs/VERIFIED_INTENTS.md).
+
+- **Prevents** (regular CPU): trade forgery and fake-data justification for **checkable**
+  strategies — deterministic rules (T1) and rules over a signed-AI verdict (T2).
+- **Residual:** a host can still *withhold* a valid trade or pick *when* among genuinely-justified
+  moments; **opaque** strategies (T3) the signer can't re-run aren't covered — use the hardware road.
+
+## Sealed Agents — the hardware road (any strategy)
+
+For strategies the signer can't re-check, run the agent inside a **TEE** (SEV-SNP / TDX / SGX /
+Nitro / H100 CC); the signer trusts trades only from an attested enclave, so the host can't
+observe or alter the agent at all. Needs special hardware. Design:
+[docs/SEALED_AGENTS.md](docs/SEALED_AGENTS.md).
+
+**Summary:** no drain (always) · no forgery for checkable strategies (Verified Intents, any CPU) ·
+no influence at all for any strategy (Sealed Agents, TEE hardware).
+
 ## The master key
 
 `CIRCUIT_SIGNER_MASTER_KEY` (32 bytes, hex or base64) unlocks every agent wallet
