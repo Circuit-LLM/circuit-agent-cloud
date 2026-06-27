@@ -160,6 +160,22 @@ function assertNodeIdentity(nodeId, authedNode) {
   if (n?.pubkey && n.pubkey !== authedNode) { const e = new Error('nodeId bound to a different key'); e.status = 403; throw e; }
 }
 
+// Identity-or-shared-key gates for the multi-tenant routes. A valid node/owner SIGNATURE fully
+// authorizes the request — an outside operator NEVER needs the admin CLOUD_KEY to join or to manage
+// their own agents (handing that key out would also grant trust-promotion + global reads). The shared
+// key stays as a fallback ONLY for unsigned own-fleet/dev requests. Each calls require*() exactly once
+// (the nonce is single-use), so the result must be captured and reused, never re-derived.
+function authNode(ctx) {
+  const node = requireNode(ctx); // throws 401 when REQUIRE_NODE_AUTH and the signature is missing/bad
+  if (!node) auth(ctx);          // unsigned own-fleet path → shared-bearer gate
+  return node;
+}
+function authOwner(ctx) {
+  const owner = requireOwner(ctx);
+  if (!owner) auth(ctx);
+  return owner;
+}
+
 const countAssigned = (nodeId) =>
   store.listAgents((a) => a.nodeId === nodeId && a.desired === 'running').length;
 
@@ -215,10 +231,9 @@ r.get('/health', () => ({ ok: true, service: 'circuit-control-plane', nodes: sto
 
 // Operator node registers + declares its resource budget.
 r.post('/v1/nodes/register', (ctx) => {
-  auth(ctx);
   const { nodeId, caps = {}, budget = {} } = ctx.body;
   if (!nodeId) throw new Error('nodeId required');
-  const authedNode = requireNode(ctx);
+  const authedNode = authNode(ctx); // node identity authorizes registration; admin key not required
   assertNodeIdentity(nodeId, authedNode); // can't re-register another node's id under a new key
   const node = store.upsertNode({
     nodeId,
@@ -235,9 +250,8 @@ r.post('/v1/nodes/register', (ctx) => {
 
 // Heartbeat: node reports what it's running; gets back start/stop assignments.
 r.post('/v1/nodes/heartbeat', async (ctx) => {
-  auth(ctx);
   const { nodeId, running = [], usage = {} } = ctx.body;
-  assertNodeIdentity(nodeId, requireNode(ctx)); // only the node that owns this id may heartbeat as it
+  assertNodeIdentity(nodeId, authNode(ctx)); // only the node that owns this id may heartbeat as it
   const node = store.getNode(nodeId);
   if (!node) { const e = new Error('unknown node — register first'); e.status = 409; throw e; }
   node.status = 'up';
@@ -272,11 +286,10 @@ r.post('/v1/nodes/heartbeat', async (ctx) => {
 
 // Agent self-report (health/pnl) relayed by the node.
 r.post('/v1/agents/:id/report', (ctx) => {
-  auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
   // Only the node actually running this agent may report its health/logs (no cross-node poisoning).
-  const authedNode = requireNode(ctx);
+  const authedNode = authNode(ctx);
   if (authedNode) {
     const runner = a.nodeId && store.getNode(a.nodeId);
     if (!runner || runner.pubkey !== authedNode) { const e = new Error('not the node running this agent'); e.status = 403; throw e; }
@@ -289,12 +302,11 @@ r.post('/v1/agents/:id/report', (ctx) => {
 
 // ── Agent CRUD (CLI side) ──
 r.post('/v1/agents', async (ctx) => {
-  auth(ctx);
   const { name, owner, spec = {}, policy, verified } = ctx.body;
   if (!name) throw new Error('name required');
   // The agent's owner is the authenticated signer (multi-tenant) — the body's owner is only a fallback
   // in own-fleet dev. A user can only ever create agents owned by themselves.
-  const authedOwner = requireOwner(ctx);
+  const authedOwner = authOwner(ctx);
   const agentOwner = authedOwner || owner || null;
   rateLimitOwner(agentOwner); // bound one tenant's create rate
   // For a bundle-backed agent the id is the manifest's (client-chosen) agentId, so the signed binding
@@ -344,10 +356,9 @@ r.post('/v1/agents', async (ctx) => {
 });
 
 r.post('/v1/agents/:id/start', (ctx) => {
-  auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
-  assertOwns(a, requireOwner(ctx));
+  assertOwns(a, authOwner(ctx));
   a.desired = 'running';
   if (a.state === STATE.STOPPED || a.state === STATE.FAILED) a.state = STATE.PENDING;
   schedule(a);
@@ -356,10 +367,9 @@ r.post('/v1/agents/:id/start', (ctx) => {
 });
 
 r.post('/v1/agents/:id/stop', (ctx) => {
-  auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
-  assertOwns(a, requireOwner(ctx));
+  assertOwns(a, authOwner(ctx));
   a.desired = 'stopped';
   a.state = a.state === STATE.RUNNING ? STATE.STOPPING : STATE.STOPPED;
   store.persist();
@@ -367,10 +377,9 @@ r.post('/v1/agents/:id/stop', (ctx) => {
 });
 
 r.delete('/v1/agents/:id', async (ctx) => {
-  auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
-  assertOwns(a, requireOwner(ctx));
+  assertOwns(a, authOwner(ctx));
   // Destroy the off-box wallet FIRST. The signer fails closed on a non-empty wallet
   // (key-wipe is irreversible) — so if it refuses, surface that and DON'T delete the
   // control-plane record. `?force=1` overrides (abandons any remaining funds).
@@ -385,10 +394,9 @@ r.delete('/v1/agents/:id', async (ctx) => {
 
 // Owner-recovery proxies → the signer (custody). The control plane never sees the key.
 r.put('/v1/agents/:id/owner', async (ctx) => {
-  auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
-  assertOwns(a, requireOwner(ctx)); // only the CURRENT owner can hand the agent to a new owner
+  assertOwns(a, authOwner(ctx)); // only the CURRENT owner can hand the agent to a new owner
   // If a bundle is attached, the new owner must still satisfy the binding (publisher == owner) — else
   // the stored "publisher == owner" invariant silently breaks and the node would reject the bundle.
   assertBundleOwnerBinding(a.spec, ctx.body.owner, a.id);
@@ -398,40 +406,36 @@ r.put('/v1/agents/:id/owner', async (ctx) => {
   return { agent: a, signer: s };
 });
 r.post('/v1/agents/:id/withdraw', async (ctx) => {
-  auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
-  assertOwns(a, requireOwner(ctx)); // funds go to the committed owner — only the owner may trigger it
+  assertOwns(a, authOwner(ctx)); // funds go to the committed owner — only the owner may trigger it
   return signerApi('POST', `/v1/agents/${a.id}/withdraw`, { amountSol: ctx.body.amountSol }, 45000); // confirm can take ~30s
 });
 r.post('/v1/agents/:id/export', async (ctx) => {
-  auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
-  assertOwns(a, requireOwner(ctx)); // export reveals the key — owner only
+  assertOwns(a, authOwner(ctx)); // export reveals the key — owner only
   return signerApi('POST', `/v1/agents/${a.id}/export`, {});
 });
 
 r.get('/v1/agents/:id', (ctx) => {
-  auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
-  assertOwns(a, requireOwner(ctx));
+  assertOwns(a, authOwner(ctx));
   return { agent: a };
 });
 
 r.get('/v1/agents', (ctx) => {
-  auth(ctx);
-  const owner = requireOwner(ctx);
+  const owner = authOwner(ctx);
   // A signed caller sees only THEIR agents; unsigned (own-fleet dev) sees all.
   const all = store.listAgents().sort((a, b) => a.createdAt - b.createdAt);
   return { agents: owner ? all.filter((a) => a.owner === owner) : all };
 });
 
 r.get('/v1/agents/:id/logs', (ctx) => {
-  auth(ctx);
+  const owner = authOwner(ctx); // authenticate first, unconditionally — even for an unknown id
   const a = store.getAgent(ctx.params.id);
-  if (a) assertOwns(a, requireOwner(ctx));
+  if (a) assertOwns(a, owner);
   const since = Number(ctx.query.since || 0);
   return { lines: store.getLogs(ctx.params.id, since) };
 });
