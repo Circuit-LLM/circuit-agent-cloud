@@ -5,7 +5,7 @@ import { nodeSatisfies, SANDBOX_RANK } from '../lib/proto.js';
 import { buildContainerSpec, detectOciRuntime } from '../node-host/oci.js';
 
 // ── placement gating (AGENT_BUNDLES.md §5.6) ────────────────────────────────────────
-const node = (sandbox) => ({ caps: { sandbox } });
+const node = (sandbox, trusted = false) => ({ caps: { sandbox }, trusted });
 const bundleAgent = (runtime) => ({ spec: { bundle: { runtime, manifest: { runtime } } } });
 const builtin = { spec: { workload: 'agentd' } };
 
@@ -14,16 +14,17 @@ assert.equal(SANDBOX_RANK.none < SANDBOX_RANK.node && SANDBOX_RANK.node < SANDBO
 // built-in workloads run anywhere (today's behavior preserved)
 for (const s of ['none', 'node', 'oci', undefined]) assert.equal(nodeSatisfies(node(s), builtin), true);
 
-// a 'node' (trusted) bundle needs at least the node sandbox
+// a 'node' (trusted/own-fleet) bundle needs the node sandbox — trust flag NOT required
 assert.equal(nodeSatisfies(node('none'), bundleAgent('node')), false, "none node can't take a bundle");
 assert.equal(nodeSatisfies(node('node'), bundleAgent('node')), true);
 assert.equal(nodeSatisfies(node('oci'), bundleAgent('node')), true, 'an oci node can also run node bundles');
 
-// an 'oci' (untrusted) bundle needs an oci node — never lands on a node-only host
+// an 'oci' (untrusted) bundle needs an oci node AND an attested/trusted one
 assert.equal(nodeSatisfies(node('none'), bundleAgent('oci')), false);
 assert.equal(nodeSatisfies(node('node'), bundleAgent('oci')), false, "a node-only host won't host an untrusted bundle");
-assert.equal(nodeSatisfies(node('oci'), bundleAgent('oci')), true);
-console.log('  ✓ scheduler places bundles only on nodes that can sandbox them');
+assert.equal(nodeSatisfies(node('oci', false), bundleAgent('oci')), false, 'an oci node that is NOT attested is refused an untrusted bundle');
+assert.equal(nodeSatisfies(node('oci', true), bundleAgent('oci')), true, 'only an attested oci node hosts an untrusted bundle');
+console.log('  ✓ scheduler places bundles only on nodes that can sandbox them (oci ⇒ attested/trusted)');
 
 // ── container spec hardening ────────────────────────────────────────────────────────
 {

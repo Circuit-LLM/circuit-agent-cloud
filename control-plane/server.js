@@ -427,4 +427,18 @@ r.get('/v1/nodes', (ctx) => {
   return { nodes: store.listNodes() };
 });
 
+// Admin: mark a node trusted/attested → eligible to host UNTRUSTED (oci) bundles. Operator-gated by the
+// shared admin KEY (NOT a node or owner) — the trust decision comes from the attestation/probation
+// system, never from the node's self-reported caps. Requires CIRCUIT_CLOUD_KEY to be set.
+r.put('/v1/nodes/:id/trust', (ctx) => {
+  if (!KEY) { const e = new Error('node trust requires CIRCUIT_CLOUD_KEY (admin) to be configured'); e.status = 403; throw e; }
+  auth(ctx);
+  const n = store.getNode(ctx.params.id);
+  if (!n) throw new Error('no such node');
+  n.trusted = ctx.body.trusted === true;
+  store.persist?.();
+  log(`node ${n.nodeId} trust = ${n.trusted}`);
+  return { node: { nodeId: n.nodeId, trusted: n.trusted } };
+});
+
 r.listen(PORT, HOST, () => log(`control plane on http://${HOST}:${PORT}  state=${STATE_FILE}  auth=${KEY ? 'on' : 'open'}`));
