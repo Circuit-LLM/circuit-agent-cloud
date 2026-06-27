@@ -1,8 +1,16 @@
 # Agent Bundles — hosting arbitrary user agents on the mesh
 
-**Status:** SPEC v2 (design + implementation plan). Companion to
+**Status:** B0 + B1 + B2 **BUILT & TESTED** (localnet); B3 (TEE) is future. Companion to
 [SECURITY.md](../SECURITY.md), [VERIFIED_INTENTS.md](./VERIFIED_INTENTS.md), and
 [SEALED_AGENTS.md](./SEALED_AGENTS.md).
+
+> **What's live:** `lib/bundle.js` (content-addressed signed bundles), `lib/bundle-store.js` (CAS +
+> SSRF-hardened pull), `lib/netguard.js` (private-IP/SSRF guard), `node-host/{env,egress-proxy,oci}.js`
+> + the bundle/oci branches in `host.js`, `control-plane` owner-binding + sandbox-gated placement
+> (`lib/proto.js nodeSatisfies`), and `circuit agent create --bundle` in the CLI. Tests:
+> `test/{node-host-env,ssrf,bundle,bundle-binding,egress-proxy,sandbox-gating}.test.mjs`. The one thing
+> not exercised on this box: a *live* container run (no usable runtime here) — `detectOciRuntime()`
+> returns null and the node fails safe (won't advertise `oci`, won't be handed an untrusted bundle).
 
 **Premise.** Today the node-host runs only **known, pre-installed workloads** — `agentd` (the reference
 paper trader) and `circuit-agent` (Circuit's own bot). `resolveWorkload()` resolves a fixed set and the
@@ -271,12 +279,12 @@ on-chain position reconstruction are unchanged — failover just carries a conte
 
 ## 11. Phased rollout
 
-| Phase | Scope | Distribution | Sandbox | Lands |
+| Phase | Scope | Distribution | Sandbox | Status |
 |---|---|---|---|---|
-| **B0** | **leak fix** | — | **curated env in `startAgent`** (§5.1) | hardens *today's* hosting; no bundles needed |
-| **B1** | trusted / own-fleet | `node` tarball + sha256 | curated env + cgroup v2 + RO mount (**no ns/seccomp**) | "my own agent on my own nodes" |
-| **B2** | untrusted / community | OCI registry (digest) | rootless container + seccomp + dropped caps + **egress proxy (§6)** | the open agent marketplace |
-| **B3** | strategy-secret | OCI, attested | TEE ([Sealed Agents](./SEALED_AGENTS.md)) | confidential tier |
+| **B0** | **leak fix** | — | **curated env in `startAgent`** (§5.1) | ✅ **built + tested** |
+| **B1** | trusted / own-fleet | `node` tarball + sha256 (local CAS) | curated env + cgroup v2 + RO tree (**no ns/seccomp**) | ✅ **built + tested** (publish → verify → unpack → spawn) |
+| **B2** | untrusted / community | content-addressed store + SSRF-safe pull | hardened container (RO rootfs, cap-drop, non-root, pids/mem) + **egress proxy (§6)** + sandbox-gated placement | ✅ **built + tested** (live container run gated on a usable runtime) |
+| **B3** | strategy-secret | OCI, attested | TEE ([Sealed Agents](./SEALED_AGENTS.md)) | ⏳ future |
 
 - **B0** is a standalone security hotfix — ~20 lines, no new concepts, ships first and on its own.
 - **B1** is deliberately *small*: on a trusted node you do **not** need namespaces/seccomp (that's most of

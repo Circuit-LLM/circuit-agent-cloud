@@ -20,8 +20,10 @@ Four zero-dependency Node services that together form the agent cloud:
 | --------- | ---------- |
 | **control-plane** | Scheduler + registry + log relay + placement authority. Nodes poll it; the CLI drives agents through it. The only inbound service. |
 | **signer** | Custody. Holds each agent's wallet key **off-box** and signs policy-checked trade intents. The operator's machine never sees the key. Also issues the session lease that enforces **at-most-one** running instance per agent. |
-| **node-host** | The operator's worker. Declares a resource budget, runs assigned agents (sandboxed, bounded), forwards health + logs. Polls out only — no inbound port. Receives only a scoped session token, never a key. Writes a local `status.json` snapshot so a co-located dashboard (the [circuit-node-client](https://github.com/Circuit-LLM/circuit-node-client) **Cloud** tab) can show what it's hosting. |
+| **node-host** | The operator's worker. Declares a resource budget, runs assigned agents under a **curated env** (never the operator's whole environment), forwards health + logs. Can host **user-published agent bundles** (verified by content hash + an owner-bound signature) in the sandbox it advertises — a trusted `node` tarball or an untrusted `oci` container whose only egress is a per-node proxy. Polls out only — no inbound port. Receives only a scoped session token, never a key. Writes a local `status.json` snapshot so a co-located dashboard (the [circuit-node-client](https://github.com/Circuit-LLM/circuit-node-client) **Cloud** tab) can show what it's hosting. |
 | **agentd** | A reference agent workload (self-contained paper trader). Production runs `circuit-agent` the same way — it's just another workload command. |
+
+**Agent bundles** ([docs/AGENT_BUNDLES.md](docs/AGENT_BUNDLES.md)) — a developer publishes their own agent and the mesh hosts it. A bundle is content-addressed (its sha256 is its identity) and carries an owner-signed manifest; the control plane binds it to the owner, and the node re-verifies (hash + signature) before any code runs. Hosting is two-directional: **off-box custody** keeps the agent from touching the host's funds, and the **sandbox** keeps the agent from touching the host — curated env, read-only bundle tree, cgroup caps, and for untrusted (`oci`) bundles a hardened container whose only network path is a per-node **egress proxy** (allowlist + no private-network access). The scheduler only places a bundle on a node that advertises a sandbox strong enough for it.
 
 Driven from the terminal by **[circuit-cli](https://github.com/Circuit-LLM/circuit-cli)** (`circuit agent …`). Full design in the **[spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md)**.
 
@@ -112,14 +114,18 @@ Lowering the budget or stopping the host **drains** its agents — they reschedu
 ## Test
 
 ```bash
-npm test     # node test/e2e-signer.mjs
+npm test     # crypto + custody + bundles/sandbox + the full mesh e2e
 ```
+
+The suite covers the off-box custody crypto, the **B0/B1/B2 bundle hosting** (curated env, content-hash +
+owner-bound verification, publish→unpack→spawn, the egress proxy, sandbox-gated placement, and the SSRF
+guard), and the full end-to-end below.
 
 End-to-end (22 checks): provisions an off-box wallet, verifies a real Ed25519 signature against the agent's address, exercises every policy gate and the fence, stands up the full stack (control plane + 2 node-hosts + signer), proves the key is at the signer and **not** on the control plane, kills the owning node to confirm the agent **reschedules and the session rotates** (the old node fenced out), and drives the **live submit path** (routes on-chain, fails safe, no phantom accounting — without broadcasting). The byte-level transaction signing has its own offline check: `node test/submit-check.mjs`.
 
 ## Status & roadmap
 
-Alpha, end-to-end tested **and proven on mainnet**. Working: control plane, **off-box signer custody**, **live on-chain submit** (Jupiter Ultra, signed with the off-box key) — validated with a real funded round-trip (a buy via Jupiter v6 and a sell via DFlow's sponsored-payer route, both built → validated → off-box-signed → landed) — node-host, reference workload, scheduling, health/log relay, **crash failover**, and the **at-most-one fence**. During that dry-run the pre-sign validation did its job: it fail-closed on an unrecognized router until it was verified and allowlisted. Per the [spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md), next up: full ALT (address-lookup-table) program resolution before unsupervised size, cgroup/container sandboxing, an MPC/TEE signer behind the same API, and a Postgres store for HA.
+Alpha, end-to-end tested **and proven on mainnet**. Working: control plane, **off-box signer custody**, **live on-chain submit** (Jupiter Ultra, signed with the off-box key) — validated with a real funded round-trip (a buy via Jupiter v6 and a sell via DFlow's sponsored-payer route, both built → validated → off-box-signed → landed) — node-host, reference workload, scheduling, health/log relay, **crash failover**, and the **at-most-one fence**. During that dry-run the pre-sign validation did its job: it fail-closed on an unrecognized router until it was verified and allowlisted. **Agent-bundle hosting (B0/B1/B2) is built + tested** ([docs/AGENT_BUNDLES.md](docs/AGENT_BUNDLES.md)): the operator-env leak is closed (curated env), trusted `node` bundles run verified + sandboxed (content hash + owner-bound signature → unpack → spawn), and untrusted `oci` bundles run in a hardened container behind a per-node egress proxy, placed only on nodes that can sandbox them. Per the [spec](https://github.com/Circuit-LLM/circuit-cli/blob/main/docs/agent-cloud-spec.md), next up: full ALT (address-lookup-table) program resolution before unsupervised size, the **B3** confidential tier (TEE / Sealed Agents), an MPC/TEE signer behind the same API, and a Postgres store for HA.
 
 ## License
 
