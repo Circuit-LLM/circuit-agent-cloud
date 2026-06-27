@@ -9,11 +9,16 @@ import { isPrivateIp, assertPublicHost } from '../lib/netguard.js';
 import { pullBytes } from '../lib/bundle-store.js';
 
 // ── isPrivateIp ──────────────────────────────────────────────────────────────────
-for (const ip of ['127.0.0.1', '10.1.2.3', '192.168.0.5', '172.16.9.9', '169.254.169.254', '100.64.0.1', '0.0.0.0', '::1', 'fe80::1', 'fc00::1'])
+for (const ip of [
+  '127.0.0.1', '10.1.2.3', '192.168.0.5', '172.16.9.9', '169.254.169.254', '100.64.0.1', '0.0.0.0',
+  '255.255.255.255', '224.0.0.1', '239.1.2.3', '240.0.0.1', '192.0.0.171', '198.18.0.1', '192.0.2.5', // added ranges
+  '::1', 'fe80::1', 'fc00::1', 'ff02::1',                                                              // v6
+  '::ffff:169.254.169.254', '::ffff:a9fe:a9fe', '0:0:0:0:0:ffff:a9fe:a9fe', '::a9fe:a9fe',             // every v4-mapped/compat spelling of metadata
+])
   assert.equal(isPrivateIp(ip), true, `${ip} must be private`);
-for (const ip of ['8.8.8.8', '1.1.1.1', '93.184.216.34', '2606:4700:4700::1111'])
+for (const ip of ['8.8.8.8', '1.1.1.1', '93.184.216.34', '2606:4700:4700::1111', '::ffff:8.8.8.8'])
   assert.equal(isPrivateIp(ip), false, `${ip} must be public`);
-console.log('  ✓ isPrivateIp classifies loopback/RFC1918/CGNAT/link-local/ULA + metadata');
+console.log('  ✓ isPrivateIp classifies loopback/RFC1918/CGNAT/link-local/ULA/multicast/reserved + every IPv6 spelling of metadata');
 
 // ── assertPublicHost (DNS-rebinding aware via the resolver) ─────────────────────────
 await assert.rejects(assertPublicHost('localhost'), /local name/);

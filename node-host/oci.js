@@ -21,11 +21,17 @@ export function detectOciRuntime() {
 }
 
 // Build the container run argv for a verified, unpacked node bundle. Pure + testable: no side effects.
+//
+// SECURITY: `network` MUST be an isolated network with NO route except the per-node egress proxy.
+// HTTPS_PROXY is only an in-process convention a hostile agent can ignore — it is NOT containment. The
+// node-host refuses to run an untrusted bundle unless such a network is configured (fail-closed); the
+// operator wires it as a `--internal` bridge carrying only the proxy (+ a DOCKER-USER drop rule).
 export function buildContainerSpec({
-  runtime = 'docker', image = 'node:20-bookworm-slim', name,
-  bundleDir, dataDir, entry, env = {}, proxyUrl, memMb = 512, pids = 256,
+  runtime = 'docker', image = 'node:20-bookworm-slim@sha256:PIN_ME', name,
+  bundleDir, dataDir, entry, env = {}, proxyUrl, network, seccompProfile = 'default', memMb = 512, pids = 256,
 }) {
   if (!name || !bundleDir || !dataDir || !entry) throw new Error('buildContainerSpec: name/bundleDir/dataDir/entry required');
+  if (!network) throw new Error('buildContainerSpec: an isolated egress network is required (HTTPS_PROXY is not containment)');
   // Host-only vars make no sense in the container — drop them so the container's own values stand.
   const DROP = new Set(['PATH', 'HOME', 'TMPDIR', 'LANG', 'TZ', 'CIRCUIT_AGENT_DATA_DIR']);
   const envFlags = [];
@@ -35,9 +41,11 @@ export function buildContainerSpec({
     : [];
   const args = [
     'run', '--rm', '--name', name,
+    '--network', network,                   // isolated net — only the egress proxy is reachable
     '--read-only',                         // RO rootfs
     '--cap-drop', 'ALL',                   // no Linux capabilities
     '--security-opt', 'no-new-privileges',
+    '--security-opt', `seccomp=${seccompProfile}`, // explicit seccomp (pin a tight profile in prod)
     '--user', '65534:65534',               // nobody:nogroup
     '--pids-limit', String(pids),
     '--memory', `${memMb}m`, '--memory-swap', `${memMb}m`,

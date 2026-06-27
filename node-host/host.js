@@ -46,8 +46,15 @@ const CFG = {
     rpc: process.env.CIRCUIT_RPC_URL || '',
     jupiter: process.env.CIRCUIT_JUPITER_URL || 'https://api.jup.ag',
   },
-  // How a container reaches the host-side proxy (the docker bridge gateway by default).
+  // How a container reaches the host-side proxy (the egress-network gateway by default).
   proxyGateway: process.env.CIRCUIT_PROXY_GATEWAY || '172.17.0.1',
+  // The ISOLATED docker network untrusted oci bundles run on — must have no route except the proxy.
+  // Unset → the node fails closed and refuses oci bundles (HTTPS_PROXY alone is not containment).
+  egressNetwork: process.env.CIRCUIT_EGRESS_NETWORK || '',
+  // Address the per-agent egress proxy binds to (the egress-net gateway, NOT 0.0.0.0).
+  proxyBind: process.env.CIRCUIT_PROXY_BIND || '127.0.0.1',
+  // seccomp profile path for untrusted containers ('default' = docker's default; pin a tight one in prod).
+  seccompProfile: process.env.CIRCUIT_SECCOMP_PROFILE || 'default',
 };
 let RESOLVED_SANDBOX = null; // computed once at register()
 
@@ -112,20 +119,28 @@ async function resolveBundle(a, dir) {
     // UNTRUSTED: run the verified tree inside a hardened container, reachable network = the proxy only.
     const rt = detectOciRuntime();
     if (!rt) throw new Error('node cannot run an oci (untrusted) bundle — no usable container runtime');
+    // FAIL CLOSED: refuse to run an untrusted bundle unless a real isolated egress network is configured.
+    // HTTPS_PROXY alone is not containment (a hostile agent ignores it), so without the locked network
+    // there is no boundary — we do NOT run the bundle rather than pretend.
+    if (!CFG.egressNetwork) throw new Error('refusing oci bundle — CIRCUIT_EGRESS_NETWORK (isolated, proxy-only) not configured');
     const allowedHosts = resolveEgressHosts(b.manifest.egress, CFG.egressEndpoints);
     const proxy = createEgressProxy({ allowedHosts, onEvent: (ev, h, r) => { if (ev === 'deny') log(`egress DENY ${a.id} ${h} (${r})`); } });
-    await new Promise((res) => proxy.listen(0, '0.0.0.0', res));
+    await new Promise((res) => proxy.listen(0, CFG.proxyBind, res)); // bind to the egress-net gateway, not 0.0.0.0
     const proxyPort = proxy.address().port;
     const env = buildAgentEnv(a, '/data'); // curated (untrusted → no secrets); /data is the in-container path
     const { command, args } = buildContainerSpec({
       runtime: rt, name: `circuit-${a.id}`, bundleDir: cacheDir, dataDir: dir, entry: b.manifest.entry,
-      env, proxyUrl: `http://${CFG.proxyGateway}:${proxyPort}`, memMb: a.spec?.resources?.maxMemoryMb || CFG.maxMemoryMb,
+      env, network: CFG.egressNetwork, proxyUrl: `http://${CFG.proxyGateway}:${proxyPort}`,
+      seccompProfile: CFG.seccompProfile, memMb: capMemMb(a),
     });
-    log(`oci bundle ${b.sha256.slice(0, 12)} → ${rt}; egress proxy :${proxyPort} allow=[${allowedHosts.join(',') || 'none'}]`);
+    log(`oci bundle ${b.sha256.slice(0, 12)} → ${rt}; net=${CFG.egressNetwork} egress proxy ${CFG.proxyBind}:${proxyPort} allow=[${allowedHosts.join(',') || 'none'}]`);
     return { command, args, proxy };
   }
   return { command: process.execPath, args: [entryPath], cwd: cacheDir };
 }
+
+// A bundle's requested memory is a REQUEST; the operator's budget is the authority — never exceed it.
+const capMemMb = (a) => Math.min(Number(a.spec?.resources?.maxMemoryMb) || CFG.maxMemoryMb, CFG.maxMemoryMb);
 
 // Best-effort cgroup v2 cap (replaces the RSS poll where it can). Needs a writable cgroup delegation;
 // where that's unavailable (shared hosts, containers) we fall back to enforceMemory(). Returns true if
@@ -136,8 +151,8 @@ function applyCgroup(pid, a) {
     if (!fs.existsSync(path.join(base, 'cgroup.controllers'))) return false; // not cgroup v2
     const cg = path.join(base, 'circuit-host', String(a.id));
     fs.mkdirSync(cg, { recursive: true });
-    const memMb = a.spec?.resources?.maxMemoryMb || CFG.maxMemoryMb;
-    fs.writeFileSync(path.join(cg, 'memory.max'), String(memMb * 1024 * 1024));
+    fs.writeFileSync(path.join(cg, 'memory.max'), String(capMemMb(a) * 1024 * 1024)); // capped to operator budget
+
     fs.writeFileSync(path.join(cg, 'cgroup.procs'), String(pid));
     return true;
   } catch {
