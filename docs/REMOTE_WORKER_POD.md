@@ -24,7 +24,7 @@ brain, so it can live anywhere. Nothing in the brain needs to reach into the pod
             ┌───────────┴────────────────────────────┴────────────────────────┴───────────┐
             │                    CPU POD (the muscle — RunPod, 8 vCPU / 32 GB)              │
             │   6 × circuit-node-client  ──►  registryUrl = https://node.circuitllm.xyz     │
-            │   1 × node-host            ──►  CONTROL_PLANE = https://cloud.circuitllm.xyz   │
+            │   1 × node-host            ──►  CONTROL_PLANE = https://agents.circuitllm.xyz   │
             │        └─ spawns user agents ──► signer = https://signer.circuitllm.xyz       │
             └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -69,7 +69,7 @@ with TLS (nginx/Caddy) — you already do this for `node.circuitllm.xyz`.
 | Service | Suggested public host | Reached by | Auth on the wire |
 |---|---|---|---|
 | registry `:18940` | `node.circuitllm.xyz` *(already public)* | node-clients | node ed25519 signature (announce/ping) |
-| control-plane `:18980` | `cloud.circuitllm.xyz` | node-host | `CIRCUIT_CLOUD_KEY` bearer |
+| control-plane `:18980` | `agents.circuitllm.xyz` | node-host | `CIRCUIT_CLOUD_KEY` bearer |
 | signer `:18981` | `signer.circuitllm.xyz` | agents (session token) | bearer (provision) + **session-token fence** (trade) |
 
 ### Securing the signer (it holds the keys — do this deliberately)
@@ -112,7 +112,7 @@ Copy each node's `data/identity.json` so it keeps its address. Everything else (
 
 ### On the pod — node-host (env, or `circuit agent host`)
 ```
-CONTROL_PLANE=https://cloud.circuitllm.xyz
+CONTROL_PLANE=https://agents.circuitllm.xyz
 CIRCUIT_CLOUD_KEY=<same bearer as the CP>
 NODE_ID=runpod-1
 MAX_AGENTS=75            # capacity budget — see §6
@@ -178,7 +178,7 @@ Do it incrementally — one node first, verify, then the rest. Nothing here move
    case — see §8 before moving the rest.
 5. **Move nodes 2–6** the same way, one at a time, verifying the registry count each step.
 6. **Stand up the node-host on the pod** (§5 env), `circuit agent host --max-agents 75`. Confirm it
-   registers with the control-plane (`curl cloud.circuitllm.xyz/v1/nodes`).
+   registers with the control-plane (`curl agents.circuitllm.xyz/v1/nodes`).
 7. **Deploy a paper test agent** to the pod, confirm it runs, heartbeats, and **signs a paper trade
    through the remote signer** (the round-trip that proves the whole topology). Then enable live agents.
 8. **Decommission** the node-host that was running idle on the VPS.
