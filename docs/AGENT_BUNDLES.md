@@ -17,8 +17,10 @@
 > resource caps, keyed-RPC withheld from bundles. **Operator MUST, before enabling untrusted `oci`:**
 > (1) set `CIRCUIT_EGRESS_NETWORK` to a `--internal` bridge whose only reachable host is the proxy (+ a
 > `DOCKER-USER` drop rule) — the node refuses oci otherwise; (2) pin the base image by digest +
-> `CIRCUIT_SECCOMP_PROFILE`; (3) front the control-plane↔node channel with TLS + a node-identity auth and
-> gate `oci` placement on attested nodes (the remaining multi-tenant items in the review).
+> `CIRCUIT_SECCOMP_PROFILE`; (3) turn on the **multi-tenant auth** built 2026-06-27 — `CIRCUIT_REQUIRE_OWNER_AUTH=1`
+> (per-owner wallet auth, no IDOR), `CIRCUIT_REQUIRE_NODE_AUTH=1` (node-identity), mark trusted nodes via
+> `PUT /v1/nodes/:id/trust` (oci only lands on attested nodes), pin `CIRCUIT_FIRST_PARTY_KEYS` (node-runtime
+> = first-party only), and front the CP↔node channel with **TLS** (the one remaining deployment item).
 
 **Premise.** Today the node-host runs only **known, pre-installed workloads** — `agentd` (the reference
 paper trader) and `circuit-agent` (Circuit's own bot). `resolveWorkload()` resolves a fixed set and the

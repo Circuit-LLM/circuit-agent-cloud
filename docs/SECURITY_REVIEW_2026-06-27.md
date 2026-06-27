@@ -26,12 +26,23 @@ Five independent adversarial reviewers + author verification.
 - **Image pin** (`node:20-bookworm-slim@sha256:PIN_ME`) + a **tight seccomp profile** are slots wired in
   `oci.js`/`CFG.seccompProfile` — fill them at deploy.
 
-**Gated on the move to UNTRUSTED operators/publishers (multi-tenant), not yet implemented:**
-- **C2** custody routes open when `CIRCUIT_CLOUD_KEY` unset + no per-owner authz (IDOR). **C4** node
-  must authenticate its identity before reporting health/logs. **C5** `caps.sandbox` is self-reported —
-  gate `oci` placement on attested/probation-passed nodes. **B6/B7** the B1 `node` runtime is same-uid
-  (trusted-only by design). These are safe for the current own-fleet deployment; they are the entry
-  criteria for opening hosting to strangers.
+**Multi-tenant hardening — IMPLEMENTED 2026-06-27 (strict-mode, off by default for own-fleet):**
+- **C2 (per-owner auth + authz):** every mutating request is wallet-signed (`lib/owner-auth.js`); the CP
+  verifies + authorizes per-agent — a caller can only act on agents they own (`CIRCUIT_REQUIRE_OWNER_AUTH=1`).
+  Closes the shared-bearer IDOR. CLI signs automatically.
+- **C4 (node-identity):** nodes sign register/heartbeat/report (`lib/node-auth.js`); nodeId is TOFU-bound
+  to its key, and only the node running an agent may report it (`CIRCUIT_REQUIRE_NODE_AUTH=1`).
+- **C5 (attested placement):** an `oci` (untrusted) bundle is placed only on a `node.trusted` node, set
+  via admin `PUT /v1/nodes/:id/trust` — never the node's self-reported caps.
+- **B6/B7 (node-runtime gate):** the host refuses an unsandboxed `node`-runtime bundle from a non-first-
+  party publisher when `CIRCUIT_FIRST_PARTY_KEYS` is set (untrusted ⇒ oci).
+- **E2 (durable replay):** `FileReplayStore` (cross-process) for the x402 verifier; per-owner create
+  rate limit (`CIRCUIT_OWNER_RATE_PER_MIN`).
+
+**Still operational (deployment, not code):** **TLS** on the CP↔node channel (assignment *integrity* is
+already covered by the agentId binding + signed manifest + node re-verification; TLS is the confidentiality
+layer); a **Redis-backed** replay store for multi-HOST; the attestation/probation system that *feeds*
+`node.trusted`; and pinning the base-image digest + a tight seccomp profile.
 
 ---
  Scope: `circuit-sdk` (x402, attest,
