@@ -77,7 +77,7 @@ console.log('  ✓ verify ok (sha256 + sig + owner binding)');
 
 // ── node-host path: pull → verify → unpack → SPAWN with the curated env ─────────────
 {
-  const pulled = await pullBytes(ref.url);
+  const pulled = await pullBytes(ref.url, { storeRoot: storeDir });
   assert.deepEqual(verifyBundle(pulled, manifest, { expectedOwner: owner.address }), { ok: true });
   unpackTo(pulled, cacheDir);
   const entryPath = path.join(cacheDir, manifest.entry);
