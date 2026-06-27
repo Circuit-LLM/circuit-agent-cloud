@@ -8,6 +8,7 @@ import { Router, sendJson } from '../lib/http.js';
 import { Store } from '../lib/store.js';
 import { STATE, nodeSatisfies, normalizePolicy, normalizeVerified, newId, now } from '../lib/proto.js';
 import { verifyManifest } from '../lib/bundle.js';
+import { verifyOwnerRequest, NonceStore } from '../lib/owner-auth.js';
 
 const PORT = Number(process.env.PORT || 18980);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -98,6 +99,30 @@ function auth(ctx) {
   if (!KEY) return; // open in dev / localhost
   const got = (ctx.req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   if (got !== KEY) { const e = new Error('unauthorized'); e.status = 401; throw e; }
+}
+
+// ── Per-owner authorization (multi-tenant) ──────────────────────────────────────────────────────────
+// REQUIRE_OWNER_AUTH=1 makes wallet-signed owner auth mandatory on every owner route (the live / multi-
+// tenant posture). Off (own-fleet dev): a signature is still verified + enforced when present, but an
+// unsigned request falls back to the shared-bearer gate above.
+const REQUIRE_OWNER_AUTH = process.env.CIRCUIT_REQUIRE_OWNER_AUTH === '1';
+const nonceStore = new NonceStore();
+
+// Authenticate the caller as an owner. Returns the owner pubkey, or null when unsigned (and allowed).
+function requireOwner(ctx) {
+  const path = new URL(ctx.req.url, 'http://x').pathname;
+  const owner = verifyOwnerRequest(
+    { method: ctx.req.method, path, body: ctx.body, headers: ctx.req.headers },
+    { nonceStore },
+  );
+  if (!owner && REQUIRE_OWNER_AUTH) { const e = new Error('owner signature required'); e.status = 401; throw e; }
+  return owner;
+}
+
+// A caller may only act on an agent they own. In strict mode an owned agent REQUIRES a matching signer.
+function assertOwns(agent, owner) {
+  if (owner && agent.owner && agent.owner !== owner) { const e = new Error('not your agent'); e.status = 403; throw e; }
+  if (REQUIRE_OWNER_AUTH && agent.owner && owner !== agent.owner) { const e = new Error('owner auth required for this agent'); e.status = 403; throw e; }
 }
 
 const countAssigned = (nodeId) =>
@@ -222,6 +247,10 @@ r.post('/v1/agents', async (ctx) => {
   auth(ctx);
   const { name, owner, spec = {}, policy, verified } = ctx.body;
   if (!name) throw new Error('name required');
+  // The agent's owner is the authenticated signer (multi-tenant) — the body's owner is only a fallback
+  // in own-fleet dev. A user can only ever create agents owned by themselves.
+  const authedOwner = requireOwner(ctx);
+  const agentOwner = authedOwner || owner || null;
   // For a bundle-backed agent the id is the manifest's (client-chosen) agentId, so the signed binding
   // matches the agent by construction. Validate the charset (safe for fs paths / argv) + uniqueness.
   let id;
@@ -232,11 +261,11 @@ r.post('/v1/agents', async (ctx) => {
   } else {
     id = newId('agt');
   }
-  assertBundleOwnerBinding(spec, owner, id); // a bundle binds only to its owner AND this exact agent id
+  assertBundleOwnerBinding(spec, agentOwner, id); // a bundle binds only to its owner AND this exact agent id
   const agent = {
     id,
     name,
-    owner: owner || null,
+    owner: agentOwner,
     spec,
     custody: 'offbox-signer',
     policy: normalizePolicy(policy),
@@ -272,6 +301,7 @@ r.post('/v1/agents/:id/start', (ctx) => {
   auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
+  assertOwns(a, requireOwner(ctx));
   a.desired = 'running';
   if (a.state === STATE.STOPPED || a.state === STATE.FAILED) a.state = STATE.PENDING;
   schedule(a);
@@ -283,6 +313,7 @@ r.post('/v1/agents/:id/stop', (ctx) => {
   auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
+  assertOwns(a, requireOwner(ctx));
   a.desired = 'stopped';
   a.state = a.state === STATE.RUNNING ? STATE.STOPPING : STATE.STOPPED;
   store.persist();
@@ -293,6 +324,7 @@ r.delete('/v1/agents/:id', async (ctx) => {
   auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
+  assertOwns(a, requireOwner(ctx));
   // Destroy the off-box wallet FIRST. The signer fails closed on a non-empty wallet
   // (key-wipe is irreversible) — so if it refuses, surface that and DON'T delete the
   // control-plane record. `?force=1` overrides (abandons any remaining funds).
@@ -310,6 +342,7 @@ r.put('/v1/agents/:id/owner', async (ctx) => {
   auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
+  assertOwns(a, requireOwner(ctx)); // only the CURRENT owner can hand the agent to a new owner
   // If a bundle is attached, the new owner must still satisfy the binding (publisher == owner) — else
   // the stored "publisher == owner" invariant silently breaks and the node would reject the bundle.
   assertBundleOwnerBinding(a.spec, ctx.body.owner, a.id);
@@ -322,12 +355,14 @@ r.post('/v1/agents/:id/withdraw', async (ctx) => {
   auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
+  assertOwns(a, requireOwner(ctx)); // funds go to the committed owner — only the owner may trigger it
   return signerApi('POST', `/v1/agents/${a.id}/withdraw`, { amountSol: ctx.body.amountSol }, 45000); // confirm can take ~30s
 });
 r.post('/v1/agents/:id/export', async (ctx) => {
   auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
+  assertOwns(a, requireOwner(ctx)); // export reveals the key — owner only
   return signerApi('POST', `/v1/agents/${a.id}/export`, {});
 });
 
@@ -335,16 +370,22 @@ r.get('/v1/agents/:id', (ctx) => {
   auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
+  assertOwns(a, requireOwner(ctx));
   return { agent: a };
 });
 
 r.get('/v1/agents', (ctx) => {
   auth(ctx);
-  return { agents: store.listAgents().sort((a, b) => a.createdAt - b.createdAt) };
+  const owner = requireOwner(ctx);
+  // A signed caller sees only THEIR agents; unsigned (own-fleet dev) sees all.
+  const all = store.listAgents().sort((a, b) => a.createdAt - b.createdAt);
+  return { agents: owner ? all.filter((a) => a.owner === owner) : all };
 });
 
 r.get('/v1/agents/:id/logs', (ctx) => {
   auth(ctx);
+  const a = store.getAgent(ctx.params.id);
+  if (a) assertOwns(a, requireOwner(ctx));
   const since = Number(ctx.query.since || 0);
   return { lines: store.getLogs(ctx.params.id, since) };
 });
