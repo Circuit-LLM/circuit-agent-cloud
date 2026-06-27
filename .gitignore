@@ -12,3 +12,8 @@ keys.json
 agents.json
 .circuit-signer/
 .circuit-cloud/
+
+# operator/host-specific launchers (fetch secrets from local Infisical at start)
+run-signer.sh
+run-control-plane.sh
+run-node-host.sh
