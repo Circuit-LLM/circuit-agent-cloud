@@ -9,11 +9,14 @@
 //   untrusted (a user bundle, B1+)              → base + endpoints (URLs only), NEVER secrets
 import path from 'node:path';
 
-// Service-endpoint URLs (not secrets) the workloads read. Forwarded at every trust level.
-// NOTE: under B2 the node-host points CIRCUIT_RPC_URL (and friends) at the per-node egress proxy
-// rather than the operator's real, possibly-keyed upstream — so an untrusted bundle gets a reachable
-// URL but never the operator's RPC credentials.
-export const ENDPOINT_ENV = ['CIRCUIT_API_URL', 'GATEWAY_URL', 'PRICE_FEED_URL', 'CIRCUIT_RPC_URL'];
+// Service-endpoint URLs with NO embedded credential (agents authenticate via x402/session). Safe to
+// forward at any trust level.
+export const ENDPOINT_ENV = ['CIRCUIT_API_URL', 'GATEWAY_URL', 'PRICE_FEED_URL', 'CIRCUIT_INFERENCE_URL'];
+
+// Endpoint URLs that MAY embed a credential (e.g. a keyed Helius RPC URL). Forwarded verbatim ONLY to
+// trusted built-ins. For an UNTRUSTED bundle the keyed value is withheld; if the operator set a keyless/
+// proxied CIRCUIT_PUBLIC_RPC_URL it is substituted as CIRCUIT_RPC_URL, otherwise RPC is simply absent.
+export const CREDENTIALED_ENDPOINT_ENV = ['CIRCUIT_RPC_URL'];
 
 // First-party workload secrets — forwarded ONLY to trusted built-in workloads, never to a bundle.
 export const SECRET_ENV = ['AGENT_KEYPAIR', 'CIRCUIT_SETUP_KEYPAIR', 'CIRCUIT_INTERNAL_KEY',
@@ -24,6 +27,10 @@ const COSMETIC_ENV = ['FORCE_COLOR'];
 
 // Identity/session vars the host sets itself — a spec.env can never shadow these.
 const PROTECTED = [/^CIRCUIT_AGENT_/, /^CIRCUIT_SIGNER_/];
+
+// Process-influencing vars a spec.env must NEVER set — they steer the runtime itself (code-load /
+// linker control). Blocked at every trust level; spec.env is for app config, not process tuning.
+const DANGEROUS_ENV = [/^NODE_OPTIONS$/, /^LD_/, /^BASH_ENV$/, /^npm_config_/i, /^DYLD_/];
 
 /**
  * Build the curated env for a hosted workload.
@@ -60,15 +67,18 @@ export function buildAgentEnv(a, dir, srcEnv = process.env) {
     env.CIRCUIT_AGENT_PAPER = signer.paper === false ? '0' : '1';
   }
 
-  // 3. allowlisted passthrough — endpoints for everyone, first-party secrets only for trusted built-ins
-  const allow = [...ENDPOINT_ENV, ...COSMETIC_ENV, ...(trusted ? SECRET_ENV : [])];
+  // 3. allowlisted passthrough — safe endpoints for everyone; credentialed endpoints + first-party
+  //    secrets only for trusted built-ins. An untrusted bundle NEVER receives a keyed URL or a secret.
+  const allow = [...ENDPOINT_ENV, ...COSMETIC_ENV, ...(trusted ? [...CREDENTIALED_ENDPOINT_ENV, ...SECRET_ENV] : [])];
   for (const k of allow) if (srcEnv[k] != null) env[k] = srcEnv[k];
+  if (!trusted && srcEnv.CIRCUIT_PUBLIC_RPC_URL) env.CIRCUIT_RPC_URL = srcEnv.CIRCUIT_PUBLIC_RPC_URL; // keyless RPC substitute
 
-  // 4. agent-declared env (spec.env), validated: can't shadow an identity var, and an untrusted
-  //    bundle can't smuggle a secret-named var to trick a downstream into reading it
+  // 4. agent-declared env (spec.env), validated: can't shadow an identity var, smuggle a secret-named
+  //    var (untrusted), or set a process-influencing var (any trust level)
   for (const [k, v] of Object.entries(spec.env || {})) {
     if (PROTECTED.some((re) => re.test(k))) continue;
-    if (!trusted && SECRET_ENV.includes(k)) continue;
+    if (DANGEROUS_ENV.some((re) => re.test(k))) continue;
+    if (!trusted && (SECRET_ENV.includes(k) || CREDENTIALED_ENDPOINT_ENV.includes(k))) continue;
     env[k] = String(v);
   }
   return env;

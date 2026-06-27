@@ -47,7 +47,7 @@ const signer = { url: 'http://signer', agentId: 'a1', epoch: 3, token: 'sess-tok
 // ── untrusted bundle (B1+) ──────────────────────────────────────────────────────────
 {
   const env = buildAgentEnv(
-    { name: 'userbot', spec: { bundle: { sha256: 'abc' }, env: { AGENT_KEYPAIR: 'evil-smuggle', FOO: 'bar' } }, signer },
+    { name: 'userbot', spec: { bundle: { sha256: 'abc' }, env: { AGENT_KEYPAIR: 'evil-smuggle', CIRCUIT_RPC_URL: 'evil', NODE_OPTIONS: '--require /data/evil.js', LD_PRELOAD: '/data/x.so', FOO: 'bar' } }, signer },
     '/data/userbot', srcEnv,
   );
 
@@ -59,12 +59,24 @@ const signer = { url: 'http://signer', agentId: 'a1', epoch: 3, token: 'sess-tok
   for (const k of SECRET_ENV) assert.equal(env[k], undefined, `bundle must not receive secret ${k}`);
   assert.equal(env.AGENT_KEYPAIR, undefined, 'bundle cannot smuggle a secret-named var through spec.env');
 
-  // endpoints still reachable (under B2 these point at the per-node egress proxy, not the real upstream)
-  assert.equal(env.CIRCUIT_RPC_URL, 'https://rpc.example/?api-key=xyz');
-  // benign declared env passes
+  // the KEYED RPC URL is withheld from an untrusted bundle (D1) — not from the operator env, not smuggled
+  assert.equal(env.CIRCUIT_RPC_URL, undefined, 'untrusted bundle does NOT get the keyed CIRCUIT_RPC_URL');
+  // process-influencing vars are dropped (D2)
+  assert.equal(env.NODE_OPTIONS, undefined, 'NODE_OPTIONS cannot be set via spec.env');
+  assert.equal(env.LD_PRELOAD, undefined, 'LD_PRELOAD cannot be set via spec.env');
+  // a safe (non-credentialed) endpoint is still reachable; benign declared env passes; no unrelated leak
+  assert.equal(env.GATEWAY_URL, 'https://gateway.example');
   assert.equal(env.FOO, 'bar', 'benign spec.env var passes through');
-  // and still no unrelated leak
   assert.equal(env.OPERATOR_SSH_KEY, undefined);
+}
+
+// ── untrusted bundle gets a substituted keyless RPC when the operator provides one ───
+{
+  const env = buildAgentEnv(
+    { name: 'ub2', spec: { bundle: { sha256: 'abc' } }, signer },
+    '/data/ub2', { ...srcEnv, CIRCUIT_PUBLIC_RPC_URL: 'https://public-rpc.example' },
+  );
+  assert.equal(env.CIRCUIT_RPC_URL, 'https://public-rpc.example', 'keyless public RPC substituted for untrusted');
 }
 
 // ── spec.env can't shadow protected identity vars ────────────────────────────────────
