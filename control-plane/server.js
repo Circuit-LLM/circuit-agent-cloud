@@ -81,7 +81,7 @@ function bundleBlockFor(a) {
 
 // Owner-binding gate (AGENT_BUNDLES.md §7): a bundle may only be attached to an agent by its owner.
 // "Signed" isn't enough — the publisher key must equal the agent's owner. Throws on any mismatch.
-function assertBundleOwnerBinding(spec, owner) {
+function assertBundleOwnerBinding(spec, owner, agentId) {
   const b = spec?.bundle;
   if (!b) return;
   const m = b.manifest;
@@ -89,6 +89,7 @@ function assertBundleOwnerBinding(spec, owner) {
   if (!owner) throw new Error('a bundle-backed agent requires an owner');
   if (!verifyManifest(m)) throw new Error('bundle manifest signature is invalid');
   if (m.publisherPubkey !== owner) throw new Error('bundle publisher is not the agent owner');
+  if (agentId && m.agentId !== agentId) throw new Error('bundle manifest is not bound to this agent');
   if (m.sha256 !== b.sha256) throw new Error('bundle sha256 does not match its manifest');
   if (m.runtime !== (b.runtime || m.runtime)) throw new Error('bundle runtime mismatch');
 }
@@ -221,9 +222,19 @@ r.post('/v1/agents', async (ctx) => {
   auth(ctx);
   const { name, owner, spec = {}, policy, verified } = ctx.body;
   if (!name) throw new Error('name required');
-  assertBundleOwnerBinding(spec, owner); // B1: a bundle binds only to its owner (reject otherwise)
+  // For a bundle-backed agent the id is the manifest's (client-chosen) agentId, so the signed binding
+  // matches the agent by construction. Validate the charset (safe for fs paths / argv) + uniqueness.
+  let id;
+  if (spec?.bundle?.manifest?.agentId) {
+    id = String(spec.bundle.manifest.agentId);
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id)) throw new Error('bundle agentId must be alphanumeric-led, [A-Za-z0-9_-], ≤64 chars');
+    if (store.getAgent(id)) throw new Error(`agent id "${id}" already exists`);
+  } else {
+    id = newId('agt');
+  }
+  assertBundleOwnerBinding(spec, owner, id); // a bundle binds only to its owner AND this exact agent id
   const agent = {
-    id: newId('agt'),
+    id,
     name,
     owner: owner || null,
     spec,
@@ -299,6 +310,9 @@ r.put('/v1/agents/:id/owner', async (ctx) => {
   auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
+  // If a bundle is attached, the new owner must still satisfy the binding (publisher == owner) — else
+  // the stored "publisher == owner" invariant silently breaks and the node would reject the bundle.
+  assertBundleOwnerBinding(a.spec, ctx.body.owner, a.id);
   a.owner = ctx.body.owner;
   const s = await signerApi('PUT', `/v1/agents/${a.id}/owner`, { owner: ctx.body.owner });
   store.putAgent(a);

@@ -104,7 +104,7 @@ async function resolveBundle(a, dir) {
     // malicious publisher could point at an internal service or the cloud metadata endpoint).
     const isHttp = /^https?:\/\//.test(CFG.bundleStoreBase);
     const bytes = await pullBytes(bundleStoreUrl(b.sha256), { storeRoot: isHttp ? undefined : CFG.bundleStoreBase });
-    const v = verifyBundle(bytes, b.manifest, { expectedOwner: a.owner || undefined });
+    const v = verifyBundle(bytes, b.manifest, { expectedOwner: a.owner || undefined, expectedAgentId: a.id });
     if (!v.ok) throw new Error(`bundle verify failed (${v.code}) for ${b.sha256.slice(0, 12)}`);
     fs.rmSync(cacheDir, { recursive: true, force: true });
     unpackTo(bytes, cacheDir);

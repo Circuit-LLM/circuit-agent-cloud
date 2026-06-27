@@ -7,7 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
-import { createBundle, verifyBundle, unpackTo } from '../lib/bundle.js';
+import { createBundle, verifyBundle, unpackTo, isSafeEntry } from '../lib/bundle.js';
 import { LocalBundleStore, pullBytes } from '../lib/bundle-store.js';
 import { buildAgentEnv } from '../node-host/env.js';
 import { newKeypair } from '../lib/ed25519.js';
@@ -73,6 +73,21 @@ console.log('  ✓ verify ok (sha256 + sig + owner binding)');
   assert.deepEqual(verifyBundle(hostile.bytes, hostile.manifest), { ok: true }, 'sig alone is valid');
   assert.equal(verifyBundle(hostile.bytes, hostile.manifest, { expectedOwner: owner.address }).code, 'publisher-not-owner');
   console.log('  ✓ wrong publisher rejected (publisher-not-owner)');
+}
+
+// ── verify: manifest must target THIS agent (agentId binding) ───────────────────────
+{
+  assert.deepEqual(verifyBundle(bytes, manifest, { expectedOwner: owner.address, expectedAgentId: agentId }), { ok: true });
+  assert.equal(verifyBundle(bytes, manifest, { expectedAgentId: 'some-other-agent' }).code, 'agent-id-mismatch');
+  console.log('  ✓ manifest agentId is bound (wrong agent rejected)');
+}
+
+// ── entry escape: a path-traversal entry can never be published or verified ──────────
+{
+  assert.equal(isSafeEntry('agent.js'), true);
+  for (const bad of ['..', '.', '../x', 'a/b', '/etc/passwd', '']) assert.equal(isSafeEntry(bad), false, `entry '${bad}' must be unsafe`);
+  assert.throws(() => createBundle({ dir: srcDir, agentId, entry: '..', priv: owner.priv, publisherPubkey: owner.address }), /unsafe entry/);
+  console.log('  ✓ path-traversal entry rejected at publish + verify');
 }
 
 // ── node-host path: pull → verify → unpack → SPAWN with the curated env ─────────────

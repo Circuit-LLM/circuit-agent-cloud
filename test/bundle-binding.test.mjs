@@ -22,9 +22,9 @@ fs.writeFileSync(path.join(srcDir, 'agent.js'), 'console.log("hi");');
 const owner = newKeypair();
 const stranger = newKeypair();
 
-// a real signed bundle published by `owner`
-const { sha256, manifest } = createBundle({ dir: srcDir, agentId: 'x', entry: 'agent.js', priv: owner.priv, publisherPubkey: owner.address });
-const bundleSpec = (m = manifest) => ({ bundle: { ref: `bundle://${sha256}`, url: path.join(tmp, 'unused.tgz'), sha256, runtime: 'node', manifest: m } });
+// a fresh signed bundle per case (the agent id is now the manifest's agentId, which must be unique)
+const mkBundle = (agentId, signer = owner) => createBundle({ dir: srcDir, agentId, entry: 'agent.js', priv: signer.priv, publisherPubkey: signer.address });
+const specOf = (b, m = b.manifest) => ({ bundle: { ref: `bundle://${b.sha256}`, url: path.join(tmp, 'unused.tgz'), sha256: b.sha256, runtime: 'node', manifest: m } });
 
 const post = async (body) => {
   const r = await fetch(`${BASE}/v1/agents`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
@@ -43,17 +43,17 @@ try {
     try { await fetch(`${BASE}/v1/nodes`); break; } catch { await new Promise((r) => setTimeout(r, 100)); }
   }
 
-  // ✓ valid: publisher == owner → accepted (no signer configured, so it creates straight away)
+  // ✓ valid: publisher == owner → accepted; the agent id IS the manifest's agentId
   {
-    const r = await post({ name: 'ok-bot', owner: owner.address, spec: bundleSpec() });
+    const r = await post({ name: 'ok-bot', owner: owner.address, spec: specOf(mkBundle('okbot')) });
     assert.equal(r.status, 200, `valid binding should be accepted: ${JSON.stringify(r.body)}`);
-    assert.ok(r.body.agent?.id, 'agent created');
-    console.log('  ✓ valid bundle (publisher == owner) accepted');
+    assert.equal(r.body.agent?.id, 'okbot', 'agent id adopted from the signed manifest');
+    console.log('  ✓ valid bundle (publisher == owner) accepted; id bound to the manifest');
   }
 
   // ✗ wrong owner: publisher != owner
   {
-    const r = await post({ name: 'bad-owner', owner: stranger.address, spec: bundleSpec() });
+    const r = await post({ name: 'bad-owner', owner: stranger.address, spec: specOf(mkBundle('badowner')) });
     assert.equal(r.status, 400);
     assert.match(r.body.error, /publisher is not the agent owner/, r.body.error);
     console.log('  ✓ wrong owner rejected');
@@ -61,15 +61,25 @@ try {
 
   // ✗ tampered manifest (sdk changed → sig breaks)
   {
-    const r = await post({ name: 'tampered', owner: owner.address, spec: bundleSpec({ ...manifest, sdk: 'evil' }) });
+    const b = mkBundle('tampered');
+    const r = await post({ name: 'tampered', owner: owner.address, spec: specOf(b, { ...b.manifest, sdk: 'evil' }) });
     assert.equal(r.status, 400);
     assert.match(r.body.error, /signature is invalid/, r.body.error);
     console.log('  ✓ tampered manifest rejected');
   }
 
+  // ✗ tampered egress (now a SIGNED field — widening the allowlist breaks the sig)
+  {
+    const b = mkBundle('egresstamper');
+    const r = await post({ name: 'egress', owner: owner.address, spec: specOf(b, { ...b.manifest, egress: ['signer', 'rpc'] }) });
+    assert.equal(r.status, 400);
+    assert.match(r.body.error, /signature is invalid/, r.body.error);
+    console.log('  ✓ tampered egress allowlist rejected (egress is signed)');
+  }
+
   // ✗ no owner at all
   {
-    const r = await post({ name: 'no-owner', spec: bundleSpec() });
+    const r = await post({ name: 'no-owner', spec: specOf(mkBundle('noowner')) });
     assert.equal(r.status, 400);
     assert.match(r.body.error, /requires an owner/, r.body.error);
     console.log('  ✓ missing owner rejected');
