@@ -7,6 +7,7 @@ import path from 'node:path';
 import { Router, sendJson } from '../lib/http.js';
 import { Store } from '../lib/store.js';
 import { STATE, nodeSatisfies, normalizePolicy, normalizeVerified, newId, now } from '../lib/proto.js';
+import { verifyManifest } from '../lib/bundle.js';
 
 const PORT = Number(process.env.PORT || 18980);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -68,6 +69,28 @@ function signerBlockFor(a) {
     address: a.address || null,
     paper: a.paper !== false,
   };
+}
+
+// B1 — the bundle block the node pulls + verifies. Carries the pull URL, the content hash, the
+// runtime, and the signed manifest (so the node re-checks the sig + owner binding before running).
+function bundleBlockFor(a) {
+  const b = a.spec?.bundle;
+  if (!b) return undefined;
+  return { url: b.url, sha256: b.sha256, runtime: b.runtime || b.manifest?.runtime || 'node', manifest: b.manifest };
+}
+
+// Owner-binding gate (AGENT_BUNDLES.md §7): a bundle may only be attached to an agent by its owner.
+// "Signed" isn't enough — the publisher key must equal the agent's owner. Throws on any mismatch.
+function assertBundleOwnerBinding(spec, owner) {
+  const b = spec?.bundle;
+  if (!b) return;
+  const m = b.manifest;
+  if (!m) throw new Error('spec.bundle requires a signed manifest');
+  if (!owner) throw new Error('a bundle-backed agent requires an owner');
+  if (!verifyManifest(m)) throw new Error('bundle manifest signature is invalid');
+  if (m.publisherPubkey !== owner) throw new Error('bundle publisher is not the agent owner');
+  if (m.sha256 !== b.sha256) throw new Error('bundle sha256 does not match its manifest');
+  if (m.runtime !== (b.runtime || m.runtime)) throw new Error('bundle runtime mismatch');
 }
 
 function auth(ctx) {
@@ -162,7 +185,7 @@ r.post('/v1/nodes/heartbeat', async (ctx) => {
     const isRunning = running.includes(a.id);
     if (a.desired === 'running' && !isRunning) {
       await ensureSession(a); // (re)open the lease for this placement — the fence
-      assignments.push({ action: 'start', agent: { id: a.id, name: a.name, spec: a.spec, signer: signerBlockFor(a) } });
+      assignments.push({ action: 'start', agent: { id: a.id, name: a.name, owner: a.owner, spec: a.spec, bundle: bundleBlockFor(a), signer: signerBlockFor(a) } });
     } else if (a.desired === 'running' && isRunning) {
       a.state = STATE.RUNNING;
     } else if (a.desired !== 'running' && isRunning) {
@@ -198,6 +221,7 @@ r.post('/v1/agents', async (ctx) => {
   auth(ctx);
   const { name, owner, spec = {}, policy, verified } = ctx.body;
   if (!name) throw new Error('name required');
+  assertBundleOwnerBinding(spec, owner); // B1: a bundle binds only to its owner (reject otherwise)
   const agent = {
     id: newId('agt'),
     name,

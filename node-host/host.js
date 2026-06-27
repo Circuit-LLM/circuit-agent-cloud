@@ -7,9 +7,11 @@
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { buildAgentEnv } from './env.js';
+import { verifyBundle, unpackTo } from '../lib/bundle.js';
+import { pullBytes } from '../lib/bundle-store.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -25,6 +27,11 @@ const CFG = {
   key: process.env.CIRCUIT_CLOUD_KEY || '',
   heartbeatMs: Number(process.env.HEARTBEAT_MS || 8000),
   circuitAgentDir: process.env.CIRCUIT_AGENT_DIR || path.join(os.homedir(), 'circuit-agent'),
+  // B1+: where verified bundles are unpacked (cached by sha256), and what isolation this node can
+  // enforce — 'node' = curated-env + cgroup + RO-bind (trusted bundles), 'oci' = container (B2),
+  // 'none' = built-in workloads only. The scheduler won't place a bundle a node can't sandbox.
+  bundleCacheDir: process.env.BUNDLE_CACHE_DIR || path.join(process.env.HOST_DATA_DIR || path.join(os.homedir(), '.circuit-host'), 'bundles'),
+  sandbox: process.env.SANDBOX || 'node',
 };
 
 const log = (...a) => console.log(`[${new Date().toISOString()}] [host]`, ...a);
@@ -41,27 +48,76 @@ const api = async (method, p, body) => {
   return r.json();
 };
 
-function resolveWorkload(spec) {
-  const w = spec?.workload || 'agentd';
-  if (w === 'circuit-agent') return { command: process.execPath, args: [path.join(CFG.circuitAgentDir, 'agent.js'), 'start'] };
-  return { command: process.execPath, args: [path.join(REPO, 'agentd', 'agentd.js')] }; // reference workload
+async function resolveWorkload(a, dir) {
+  const spec = a.spec || {};
+  if (a.bundle || spec.bundle) return resolveBundle(a);           // B1+: a user-published bundle
+  const w = spec.workload || 'agentd';
+  if (w === 'circuit-agent') return { command: process.execPath, args: [path.join(CFG.circuitAgentDir, 'agent.js'), 'start'], cwd: dir };
+  return { command: process.execPath, args: [path.join(REPO, 'agentd', 'agentd.js')], cwd: dir }; // reference workload
 }
 
-function startAgent(a) {
+// B1 — pull → verify (sha256 + manifest sig + owner binding) → unpack (cache by sha256) → run with
+// node. No unverified bytes ever execute; the unpacked tree is made read-only (best-effort) so the
+// agent writes only to its CIRCUIT_AGENT_DATA_DIR. Real isolation (ns/seccomp) is B2.
+async function resolveBundle(a) {
+  const b = a.bundle;
+  if (!b) throw new Error('spec.bundle set but no bundle block in the assignment');
+  if (b.runtime !== 'node') throw new Error(`this node runs 'node' bundles only (got '${b.runtime}')`);
+  const cacheDir = path.join(CFG.bundleCacheDir, b.sha256);
+  const okMarker = path.join(cacheDir, '.circuit-ok');
+  if (!fs.existsSync(okMarker)) {
+    const bytes = await pullBytes(b.url);
+    const v = verifyBundle(bytes, b.manifest, { expectedOwner: a.owner || undefined });
+    if (!v.ok) throw new Error(`bundle verify failed (${v.code}) for ${b.sha256.slice(0, 12)}`);
+    fs.rmSync(cacheDir, { recursive: true, force: true });
+    unpackTo(bytes, cacheDir);
+    fs.writeFileSync(okMarker, b.sha256);
+    try { execFileSync('chmod', ['-R', 'a-w', cacheDir]); } catch {} // RO rootfs (best-effort, trusted node)
+    log(`bundle ${b.sha256.slice(0, 12)} pulled + verified → ${cacheDir}`);
+  }
+  const entryPath = path.join(cacheDir, b.manifest.entry);
+  if (!fs.existsSync(entryPath)) throw new Error(`bundle entry '${b.manifest.entry}' missing after unpack`);
+  return { command: process.execPath, args: [entryPath], cwd: cacheDir };
+}
+
+// Best-effort cgroup v2 cap (replaces the RSS poll where it can). Needs a writable cgroup delegation;
+// where that's unavailable (shared hosts, containers) we fall back to enforceMemory(). Returns true if
+// the cgroup was applied.
+function applyCgroup(pid, a) {
+  try {
+    const base = '/sys/fs/cgroup';
+    if (!fs.existsSync(path.join(base, 'cgroup.controllers'))) return false; // not cgroup v2
+    const cg = path.join(base, 'circuit-host', String(a.id));
+    fs.mkdirSync(cg, { recursive: true });
+    const memMb = a.spec?.resources?.maxMemoryMb || CFG.maxMemoryMb;
+    fs.writeFileSync(path.join(cg, 'memory.max'), String(memMb * 1024 * 1024));
+    fs.writeFileSync(path.join(cg, 'cgroup.procs'), String(pid));
+    return true;
+  } catch {
+    return false; // enforceMemory() remains the safety net
+  }
+}
+
+async function startAgent(a) {
   if (agents.has(a.id)) return;
   if (agents.size >= CFG.maxAgents) { log(`refusing ${a.id} — at budget (${CFG.maxAgents})`); return; }
   const dir = path.join(CFG.dataDir, 'agents', a.id);
   fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(path.join(dir, 'tmp'), { recursive: true });
   try { fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(a.spec?.config || {})); } catch {}
 
-  const { command, args } = resolveWorkload(a.spec);
+  let resolved;
+  try { resolved = await resolveWorkload(a, dir); }
+  catch (e) { log(`agent ${a.id} workload resolve failed: ${e.message}`); return; }
+  const { command, args, cwd } = resolved;
+
   // SECURITY: never hand the workload the operator's whole process.env (it may hold the operator's
   // own keys/tokens). buildAgentEnv returns a curated allowlist — process minimum + the off-box
   // session token (never the signing key) + only what this trust level needs. See node-host/env.js.
-  fs.mkdirSync(path.join(dir, 'tmp'), { recursive: true });
   const env = buildAgentEnv(a, dir);
-  const proc = spawn(command, args, { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
-  const rec = { proc, name: a.name, workload: a.spec?.workload || 'agentd', dir, logBuf: [], lastSent: 0, startedAt: Date.now() };
+  const proc = spawn(command, args, { cwd: cwd || dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  const cgrouped = applyCgroup(proc.pid, a);
+  const rec = { proc, name: a.name, workload: a.spec?.bundle ? 'bundle' : (a.spec?.workload || 'agentd'), dir, cgrouped, logBuf: [], lastSent: 0, startedAt: Date.now() };
   agents.set(a.id, rec);
 
   const onData = (buf) => {
@@ -77,7 +133,7 @@ function startAgent(a) {
     log(`agent ${a.id} exited code=${code} sig=${sig}`);
     agents.delete(a.id); // reconcile loop will restart if still desired (built-in backoff = next beat)
   });
-  log(`started ${a.id} (${a.name}) workload=${a.spec?.workload || 'agentd'} dir=${dir}`);
+  log(`started ${a.id} (${a.name}) workload=${rec.workload}${cgrouped ? ' [cgroup]' : ''} dir=${dir}`);
 }
 
 function stopAgent(id) {
@@ -130,7 +186,7 @@ function writeStatus() {
 async function register() {
   await api('POST', '/v1/nodes/register', {
     nodeId: CFG.nodeId,
-    caps: { cpu: CFG.maxCpu },
+    caps: { cpu: CFG.maxCpu, sandbox: CFG.sandbox },
     budget: { maxAgents: CFG.maxAgents, maxCpu: CFG.maxCpu, maxMemoryMb: CFG.maxMemoryMb },
   });
   log(`registered as ${CFG.nodeId} (budget ${CFG.maxAgents} agents, ${CFG.maxMemoryMb}MB)`);
@@ -145,7 +201,7 @@ async function beat() {
     log(`heartbeat failed: ${e.message}`); return;
   }
   for (const as of res.assignments || []) {
-    if (as.action === 'start') startAgent(as.agent);
+    if (as.action === 'start') startAgent(as.agent).catch((e) => log(`startAgent ${as.agent?.id} failed: ${e.message}`));
     else if (as.action === 'stop') stopAgent(as.agentId);
   }
   enforceMemory();

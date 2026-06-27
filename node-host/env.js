@@ -36,7 +36,8 @@ export function buildAgentEnv(a, dir, srcEnv = process.env) {
   const spec = a?.spec || {};
   const signer = a?.signer;
   // A built-in workload is first-party/trusted; a bundle (B1+) is untrusted and gets no secrets.
-  const trusted = !spec.bundle;
+  // The bundle marker can be top-level (the start assignment) or in spec (the stored record).
+  const trusted = !(a?.bundle || spec.bundle);
 
   // 1. process minimum — HOME/TMPDIR confined to the agent's own dir, nothing inherited wholesale
   const env = {
