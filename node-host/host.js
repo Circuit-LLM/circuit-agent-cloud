@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 // Circuit Agent Cloud — node-host runner.
 // Opt-in. The operator declares a resource budget; this registers with the
-// control plane, runs the agents it's assigned (sandboxed, bounded), and
-// forwards health + logs. It only ever POLLS out — no inbound port needed.
+// control plane, runs the agents it's assigned (curated env + resource budget;
+// fuller sandboxing is staged — see docs/AGENT_BUNDLES.md), and forwards health
+// + logs. It only ever POLLS out — no inbound port needed.
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { buildAgentEnv } from './env.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -53,20 +55,11 @@ function startAgent(a) {
   try { fs.writeFileSync(path.join(dir, 'config.json'), JSON.stringify(a.spec?.config || {})); } catch {}
 
   const { command, args } = resolveWorkload(a.spec);
-  const env = { ...process.env, CIRCUIT_AGENT_DATA_DIR: dir, AGENT_NAME: a.name, ...(a.spec?.env || {}) };
-  // Custody is off-box: the operator's machine only ever receives a scoped,
-  // rotating SESSION TOKEN (good for in-policy swaps on this one agent + epoch) —
-  // never the signing key. The signer holds the key and the value can't leave.
-  if (a.signer) {
-    Object.assign(env, {
-      CIRCUIT_SIGNER_URL: a.signer.url,
-      CIRCUIT_AGENT_ID: a.signer.agentId,
-      CIRCUIT_AGENT_EPOCH: String(a.signer.epoch),
-      CIRCUIT_AGENT_SESSION: a.signer.token,
-      CIRCUIT_AGENT_ADDRESS: a.signer.address || '',
-      CIRCUIT_AGENT_PAPER: a.signer.paper === false ? '0' : '1',
-    });
-  }
+  // SECURITY: never hand the workload the operator's whole process.env (it may hold the operator's
+  // own keys/tokens). buildAgentEnv returns a curated allowlist — process minimum + the off-box
+  // session token (never the signing key) + only what this trust level needs. See node-host/env.js.
+  fs.mkdirSync(path.join(dir, 'tmp'), { recursive: true });
+  const env = buildAgentEnv(a, dir);
   const proc = spawn(command, args, { cwd: dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
   const rec = { proc, name: a.name, workload: a.spec?.workload || 'agentd', dir, logBuf: [], lastSent: 0, startedAt: Date.now() };
   agents.set(a.id, rec);
