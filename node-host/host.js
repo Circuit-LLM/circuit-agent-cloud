@@ -14,6 +14,7 @@ import { verifyBundle, unpackTo } from '../lib/bundle.js';
 import { pullBytes } from '../lib/bundle-store.js';
 import { createEgressProxy, resolveEgressHosts } from './egress-proxy.js';
 import { detectOciRuntime, buildContainerSpec } from './oci.js';
+import { loadOrCreateNodeKey, signNodeHeaders } from '../lib/node-auth.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -68,10 +69,19 @@ function bundleStoreUrl(sha) {
 const log = (...a) => console.log(`[${new Date().toISOString()}] [host]`, ...a);
 const agents = new Map(); // agentId -> { proc, name, dir, logBuf, lastSent }
 
+// Persistent node identity — signs every control-plane request so the CP can bind this nodeId to this
+// key (and reject anyone else claiming it / reporting for our agents).
+fs.mkdirSync(CFG.dataDir, { recursive: true });
+const NODE_KEY = loadOrCreateNodeKey(path.join(CFG.dataDir, 'node.key'));
+
 const api = async (method, p, body) => {
   const r = await fetch(CFG.controlPlane + p, {
     method,
-    headers: { 'Content-Type': 'application/json', ...(CFG.key ? { Authorization: `Bearer ${CFG.key}` } : {}) },
+    headers: {
+      'Content-Type': 'application/json',
+      ...(CFG.key ? { Authorization: `Bearer ${CFG.key}` } : {}),
+      ...signNodeHeaders(NODE_KEY, { method, path: p.split('?')[0], body: body ?? {} }),
+    },
     body: body ? JSON.stringify(body) : undefined,
     signal: AbortSignal.timeout(8000),
   });

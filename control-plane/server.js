@@ -9,6 +9,7 @@ import { Store } from '../lib/store.js';
 import { STATE, nodeSatisfies, normalizePolicy, normalizeVerified, newId, now } from '../lib/proto.js';
 import { verifyManifest } from '../lib/bundle.js';
 import { verifyOwnerRequest, NonceStore } from '../lib/owner-auth.js';
+import { verifyNodeRequest } from '../lib/node-auth.js';
 
 const PORT = Number(process.env.PORT || 18980);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -125,6 +126,27 @@ function assertOwns(agent, owner) {
   if (REQUIRE_OWNER_AUTH && agent.owner && owner !== agent.owner) { const e = new Error('owner auth required for this agent'); e.status = 403; throw e; }
 }
 
+// ── Node-identity auth (multi-tenant) — a node proves possession of its key on every request. ──────────
+const REQUIRE_NODE_AUTH = process.env.CIRCUIT_REQUIRE_NODE_AUTH === '1';
+const nodeNonceStore = new NonceStore();
+
+function requireNode(ctx) {
+  const path = new URL(ctx.req.url, 'http://x').pathname;
+  const node = verifyNodeRequest(
+    { method: ctx.req.method, path, body: ctx.body, headers: ctx.req.headers },
+    { nonceStore: nodeNonceStore },
+  );
+  if (!node && REQUIRE_NODE_AUTH) { const e = new Error('node signature required'); e.status = 401; throw e; }
+  return node;
+}
+
+// The nodeId is bound to the first pubkey that registered it (TOFU); a different key can't claim it.
+function assertNodeIdentity(nodeId, authedNode) {
+  if (!authedNode) return; // unsigned (own-fleet dev)
+  const n = store.getNode(nodeId);
+  if (n?.pubkey && n.pubkey !== authedNode) { const e = new Error('nodeId bound to a different key'); e.status = 403; throw e; }
+}
+
 const countAssigned = (nodeId) =>
   store.listAgents((a) => a.nodeId === nodeId && a.desired === 'running').length;
 
@@ -183,8 +205,11 @@ r.post('/v1/nodes/register', (ctx) => {
   auth(ctx);
   const { nodeId, caps = {}, budget = {} } = ctx.body;
   if (!nodeId) throw new Error('nodeId required');
+  const authedNode = requireNode(ctx);
+  assertNodeIdentity(nodeId, authedNode); // can't re-register another node's id under a new key
   const node = store.upsertNode({
     nodeId,
+    pubkey: authedNode || store.getNode(nodeId)?.pubkey || null, // bind the id to this key (TOFU)
     caps,
     budget,
     status: 'up',
@@ -199,6 +224,7 @@ r.post('/v1/nodes/register', (ctx) => {
 r.post('/v1/nodes/heartbeat', async (ctx) => {
   auth(ctx);
   const { nodeId, running = [], usage = {} } = ctx.body;
+  assertNodeIdentity(nodeId, requireNode(ctx)); // only the node that owns this id may heartbeat as it
   const node = store.getNode(nodeId);
   if (!node) { const e = new Error('unknown node — register first'); e.status = 409; throw e; }
   node.status = 'up';
@@ -236,6 +262,12 @@ r.post('/v1/agents/:id/report', (ctx) => {
   auth(ctx);
   const a = store.getAgent(ctx.params.id);
   if (!a) throw new Error('no such agent');
+  // Only the node actually running this agent may report its health/logs (no cross-node poisoning).
+  const authedNode = requireNode(ctx);
+  if (authedNode) {
+    const runner = a.nodeId && store.getNode(a.nodeId);
+    if (!runner || runner.pubkey !== authedNode) { const e = new Error('not the node running this agent'); e.status = 403; throw e; }
+  }
   a.health = ctx.body.health || a.health;
   a.lastReport = now();
   if (ctx.body.lines?.length) store.appendLogs(a.id, ctx.body.lines);
