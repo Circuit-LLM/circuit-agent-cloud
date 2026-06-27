@@ -109,6 +109,19 @@ function auth(ctx) {
 const REQUIRE_OWNER_AUTH = process.env.CIRCUIT_REQUIRE_OWNER_AUTH === '1';
 const nonceStore = new NonceStore();
 
+// Per-owner sliding-window rate limit (agent creates / min). 0 = off (own-fleet dev). Bounds one tenant
+// from exhausting shared infra (signer provisioning, store growth) at others' expense.
+const OWNER_RATE_PER_MIN = Number(process.env.CIRCUIT_OWNER_RATE_PER_MIN || 0);
+const ownerHits = new Map();
+function rateLimitOwner(owner) {
+  if (!OWNER_RATE_PER_MIN || !owner) return;
+  const t = now();
+  const hits = (ownerHits.get(owner) || []).filter((x) => t - x < 60_000);
+  if (hits.length >= OWNER_RATE_PER_MIN) { const e = new Error('rate limit exceeded — slow down'); e.status = 429; throw e; }
+  hits.push(t);
+  ownerHits.set(owner, hits);
+}
+
 // Authenticate the caller as an owner. Returns the owner pubkey, or null when unsigned (and allowed).
 function requireOwner(ctx) {
   const path = new URL(ctx.req.url, 'http://x').pathname;
@@ -283,6 +296,7 @@ r.post('/v1/agents', async (ctx) => {
   // in own-fleet dev. A user can only ever create agents owned by themselves.
   const authedOwner = requireOwner(ctx);
   const agentOwner = authedOwner || owner || null;
+  rateLimitOwner(agentOwner); // bound one tenant's create rate
   // For a bundle-backed agent the id is the manifest's (client-chosen) agentId, so the signed binding
   // matches the agent by construction. Validate the charset (safe for fs paths / argv) + uniqueness.
   let id;

@@ -44,7 +44,7 @@ const unsigned = (method, p, body) =>
 
 const cp = spawn(process.execPath, ['control-plane/server.js'], {
   cwd: REPO,
-  env: { ...process.env, PORT: String(PORT), CIRCUIT_CLOUD_STATE: path.join(tmp, 'state.json'), CIRCUIT_SIGNER_URL: '', CIRCUIT_CLOUD_KEY: '', CIRCUIT_REQUIRE_OWNER_AUTH: '1' },
+  env: { ...process.env, PORT: String(PORT), CIRCUIT_CLOUD_STATE: path.join(tmp, 'state.json'), CIRCUIT_SIGNER_URL: '', CIRCUIT_CLOUD_KEY: '', CIRCUIT_REQUIRE_OWNER_AUTH: '1', CIRCUIT_OWNER_RATE_PER_MIN: '5' },
   stdio: 'ignore',
 });
 
@@ -85,7 +85,15 @@ try {
   assert.equal((await signed(A, 'POST', `/v1/agents/${id}/start`, {})).status, 200);
   console.log('  ✓ owner A can act on their own agent; B\'s listing is empty');
 
-  console.log('owner-auth (MT#1): all assertions passed');
+  // per-owner rate limit (MT#4): A is capped at 5 creates/min
+  let got429 = false;
+  for (let i = 0; i < 8 && !got429; i++) {
+    if ((await signed(A, 'POST', '/v1/agents', { name: `rl-${i}` })).status === 429) got429 = true;
+  }
+  assert.ok(got429, 'owner A hit the per-owner create rate limit');
+  console.log('  ✓ per-owner rate limit caps a single tenant\'s create rate (429)');
+
+  console.log('owner-auth (MT#1/#4): all assertions passed');
 } finally {
   cp.kill('SIGKILL');
   fs.rmSync(tmp, { recursive: true, force: true });

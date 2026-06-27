@@ -1,7 +1,7 @@
 // B2 — scheduler gating + the container spec. A bundle is only placed on a node that can sandbox it,
 // and an untrusted (oci) bundle's container is built locked-down (RO rootfs, dropped caps, proxy egress).
 import assert from 'node:assert';
-import { nodeSatisfies, SANDBOX_RANK } from '../lib/proto.js';
+import { nodeSatisfies, SANDBOX_RANK, isFirstPartyNodeRuntime } from '../lib/proto.js';
 import { buildContainerSpec, detectOciRuntime } from '../node-host/oci.js';
 
 // ── placement gating (AGENT_BUNDLES.md §5.6) ────────────────────────────────────────
@@ -25,6 +25,12 @@ assert.equal(nodeSatisfies(node('node'), bundleAgent('oci')), false, "a node-onl
 assert.equal(nodeSatisfies(node('oci', false), bundleAgent('oci')), false, 'an oci node that is NOT attested is refused an untrusted bundle');
 assert.equal(nodeSatisfies(node('oci', true), bundleAgent('oci')), true, 'only an attested oci node hosts an untrusted bundle');
 console.log('  ✓ scheduler places bundles only on nodes that can sandbox them (oci ⇒ attested/trusted)');
+
+// ── host-side first-party gate for the unsandboxed 'node' runtime (MT#4) ─────────────
+assert.equal(isFirstPartyNodeRuntime('ANYKEY', []), true, 'empty allowlist = own-fleet, any publisher');
+assert.equal(isFirstPartyNodeRuntime('FIRST_PARTY', ['FIRST_PARTY']), true, 'listed publisher allowed');
+assert.equal(isFirstPartyNodeRuntime('STRANGER', ['FIRST_PARTY']), false, 'a stranger cannot use the node runtime — must use oci');
+console.log('  ✓ node-runtime gated to first-party publishers when an allowlist is set');
 
 // ── container spec hardening ────────────────────────────────────────────────────────
 {

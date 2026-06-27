@@ -15,6 +15,7 @@ import { pullBytes } from '../lib/bundle-store.js';
 import { createEgressProxy, resolveEgressHosts } from './egress-proxy.js';
 import { detectOciRuntime, buildContainerSpec } from './oci.js';
 import { loadOrCreateNodeKey, signNodeHeaders } from '../lib/node-auth.js';
+import { isFirstPartyNodeRuntime } from '../lib/proto.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, '..');
@@ -56,6 +57,9 @@ const CFG = {
   proxyBind: process.env.CIRCUIT_PROXY_BIND || '127.0.0.1',
   // seccomp profile path for untrusted containers ('default' = docker's default; pin a tight one in prod).
   seccompProfile: process.env.CIRCUIT_SECCOMP_PROFILE || 'default',
+  // Publishers allowed to use the unsandboxed 'node' runtime. Empty = own-fleet (allow all); when set,
+  // only these may run node-runtime bundles — every other publisher must ship 'oci'.
+  firstPartyKeys: (process.env.CIRCUIT_FIRST_PARTY_KEYS || '').split(',').map((s) => s.trim()).filter(Boolean),
 };
 let RESOLVED_SANDBOX = null; // computed once at register()
 
@@ -107,6 +111,12 @@ async function resolveBundle(a, dir) {
   const runtime = b.runtime || b.manifest?.runtime || 'node';
   if (runtime !== 'node' && runtime !== 'oci') throw new Error(`unknown bundle runtime '${runtime}'`);
   if (!/^[0-9a-f]{64}$/.test(b.sha256 || '')) throw new Error('bundle sha256 is not a 64-char hex hash');
+  // DEFENSE IN DEPTH: the 'node' runtime is an unsandboxed same-uid process — only safe for first-party
+  // code. When the operator pins CIRCUIT_FIRST_PARTY_KEYS, refuse a node-runtime bundle from any other
+  // publisher (they must use 'oci'). Don't rely solely on the scheduler having placed it correctly.
+  if (runtime === 'node' && !isFirstPartyNodeRuntime(b.manifest?.publisherPubkey, CFG.firstPartyKeys)) {
+    throw new Error('node-runtime bundle from a non-first-party publisher — untrusted publishers must use oci');
+  }
   const cacheDir = path.join(CFG.bundleCacheDir, b.sha256);
   const okMarker = path.join(cacheDir, '.circuit-ok');
   if (!fs.existsSync(okMarker)) {
