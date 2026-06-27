@@ -11,6 +11,14 @@
 > `test/{node-host-env,ssrf,bundle,bundle-binding,egress-proxy,sandbox-gating}.test.mjs`. The one thing
 > not exercised on this box: a *live* container run (no usable runtime here) — `detectOciRuntime()`
 > returns null and the node fails safe (won't advertise `oci`, won't be handed an untrusted bundle).
+>
+> **Hardened per the 2026-06-27 security review** (see [SECURITY_REVIEW_2026-06-27.md](./SECURITY_REVIEW_2026-06-27.md)):
+> signed `egress`/`resources`, safe-entry, agentId binding, IP-pinned egress (no DNS-rebind), port-pin,
+> resource caps, keyed-RPC withheld from bundles. **Operator MUST, before enabling untrusted `oci`:**
+> (1) set `CIRCUIT_EGRESS_NETWORK` to a `--internal` bridge whose only reachable host is the proxy (+ a
+> `DOCKER-USER` drop rule) — the node refuses oci otherwise; (2) pin the base image by digest +
+> `CIRCUIT_SECCOMP_PROFILE`; (3) front the control-plane↔node channel with TLS + a node-identity auth and
+> gate `oci` placement on attested nodes (the remaining multi-tenant items in the review).
 
 **Premise.** Today the node-host runs only **known, pre-installed workloads** — `agentd` (the reference
 paper trader) and `circuit-agent` (Circuit's own bot). `resolveWorkload()` resolves a fixed set and the
