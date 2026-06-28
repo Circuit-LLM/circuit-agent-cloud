@@ -259,10 +259,22 @@ r.post('/v1/nodes/heartbeat', async (ctx) => {
   node.usage = usage;
 
   const assignments = [];
+  // Free budget slots left after what the node already reports running. We only start up to this many
+  // NEW agents; any further desired-but-not-running agents assigned here are OVER budget (e.g. budget
+  // was lowered, or they piled on while this was the only capacity) → unassign so the sweep reschedules
+  // them onto a node with room. Without this they'd sit "scheduled" forever while other nodes idle.
+  let freeSlots = (node.budget?.maxAgents ?? 0) - running.length;
   // Reconcile agents this node owns.
   for (const a of store.listAgents((a) => a.nodeId === nodeId)) {
     const isRunning = running.includes(a.id);
     if (a.desired === 'running' && !isRunning) {
+      if (freeSlots <= 0) {
+        // node is at budget and isn't running this one → bounce it back to the scheduler
+        a.nodeId = null;
+        a.state = STATE.PENDING;
+        continue;
+      }
+      freeSlots--;
       await ensureSession(a); // (re)open the lease for this placement — the fence
       assignments.push({ action: 'start', agent: { id: a.id, name: a.name, owner: a.owner, spec: a.spec, bundle: bundleBlockFor(a), signer: signerBlockFor(a) } });
     } else if (a.desired === 'running' && isRunning) {
