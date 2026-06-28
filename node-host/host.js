@@ -295,8 +295,11 @@ async function beat() {
     if (e.status === 409) { await register().catch(() => {}); return; } // plane forgot us
     log(`heartbeat failed: ${e.message}`); return;
   }
+  // Start assignments SEQUENTIALLY: startAgent checks the budget then registers the agent after an
+  // await, so firing them concurrently lets several pass the check before any claims a slot — the node
+  // then runs over budget (e.g. 4 agents on a budget-2 node). Awaiting each makes the budget authoritative.
   for (const as of res.assignments || []) {
-    if (as.action === 'start') startAgent(as.agent).catch((e) => log(`startAgent ${as.agent?.id} failed: ${e.message}`));
+    if (as.action === 'start') await startAgent(as.agent).catch((e) => log(`startAgent ${as.agent?.id} failed: ${e.message}`));
     else if (as.action === 'stop') stopAgent(as.agentId);
   }
   enforceMemory();
