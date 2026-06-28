@@ -255,7 +255,21 @@ setInterval(() => {
 // ── API ───────────────────────────────────────────────────────────────────────
 const r = new Router();
 
-r.get('/health', () => ({ ok: true, service: 'circuit-control-plane', nodes: store.nodes.size, agents: store.agents.size }));
+// Aggregate cloud counts. The full node/agent LISTS are admin-gated (/v1/nodes, /v1/agents), but
+// these bare counts are harmless and let any operator's dashboard show how big the cloud is.
+const cloudCounts = () => {
+  const nodes = store.listNodes();
+  return {
+    nodes: nodes.length,
+    nodesUp: nodes.filter((n) => n.status === 'up').length,
+    agents: store.agents.size,
+    agentsRunning: store.listAgents((a) => a.state === STATE.RUNNING).length,
+  };
+};
+r.get('/health', () => ({ ok: true, service: 'circuit-control-plane', ...cloudCounts() }));
+// Public counts INSIDE the proxied /v1 namespace — nginx exposes /v1/* but not /health, so the
+// dashboard reads this. No auth: it returns only counts, never node addresses or agent details.
+r.get('/v1/summary', () => cloudCounts());
 
 // Operator node registers + declares its resource budget.
 r.post('/v1/nodes/register', (ctx) => {
