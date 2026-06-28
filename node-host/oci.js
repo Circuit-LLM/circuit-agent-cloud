@@ -26,8 +26,12 @@ export function detectOciRuntime() {
 // HTTPS_PROXY is only an in-process convention a hostile agent can ignore — it is NOT containment. The
 // node-host refuses to run an untrusted bundle unless such a network is configured (fail-closed); the
 // operator wires it as a `--internal` bridge carrying only the proxy (+ a DOCKER-USER drop rule).
+// Pinned base image (digest, not a tag) so the rootfs is reproducible + can't be swapped under us.
+// Override with CIRCUIT_OCI_IMAGE (also a digest) to track a newer base.
+export const DEFAULT_OCI_IMAGE = 'node:20-bookworm-slim@sha256:2cf067cfed83d5ea958367df9f966191a942351a2df77d6f0193e162b5febfc0';
+
 export function buildContainerSpec({
-  runtime = 'docker', image = 'node:20-bookworm-slim@sha256:PIN_ME', name,
+  runtime = 'docker', image = DEFAULT_OCI_IMAGE, name,
   bundleDir, dataDir, entry, env = {}, proxyUrl, network, seccompProfile = 'default', memMb = 512, pids = 256,
 }) {
   if (!name || !bundleDir || !dataDir || !entry) throw new Error('buildContainerSpec: name/bundleDir/dataDir/entry required');
