@@ -15,6 +15,12 @@ const PORT = Number(process.env.PORT || 18980);
 const HOST = process.env.HOST || '127.0.0.1';
 const STATE_FILE = process.env.CIRCUIT_CLOUD_STATE || path.join(os.homedir(), '.circuit-cloud', 'state.json');
 const NODE_TIMEOUT_MS = Number(process.env.NODE_TIMEOUT_MS || 30000);
+// Transition watchdog: an agent SCHEDULED to a node but never reported running within STUCK_MS (the
+// node accepted it but couldn't start it — missing workload, spawn error, …) is bounced to a DIFFERENT
+// node so it can't sit stuck. It keeps retrying (self-heals when a node is fixed); after
+// MAX_PLACE_ATTEMPTS distinct failed placements it's logged loudly so the operator notices.
+const STUCK_MS = Number(process.env.CIRCUIT_STUCK_MS || 45000);
+const MAX_PLACE_ATTEMPTS = Number(process.env.CIRCUIT_MAX_PLACE_ATTEMPTS || 3);
 const KEY = process.env.CIRCUIT_CLOUD_KEY || ''; // optional shared bearer
 
 // Off-box signer = the one custody mechanism. The control plane is the placement
@@ -180,25 +186,35 @@ const countAssigned = (nodeId) =>
   store.listAgents((a) => a.nodeId === nodeId && a.desired === 'running').length;
 
 // Place an agent on the best live node that satisfies its custody/confidential needs.
+// Best live node that satisfies the agent + has a free slot, excluding nodes that already failed to
+// start it (`avoid`). Spreads load by free capacity.
+function pickNode(agent, avoid) {
+  return store
+    .listNodes()
+    .filter((n) => n.status === 'up' && !avoid.has(n.nodeId) && nodeSatisfies(n, agent))
+    .map((n) => ({ n, free: (n.budget?.maxAgents ?? 0) - countAssigned(n.nodeId) }))
+    .filter((x) => x.free > 0)
+    .sort((a, b) => b.free - a.free)[0]?.n || null;
+}
+
 function schedule(agent) {
   if (agent.desired !== 'running') return;
   if (agent.nodeId) {
     const n = store.getNode(agent.nodeId);
     if (n && n.status === 'up') return; // already placed on a live node
   }
-  const candidates = store
-    .listNodes()
-    .filter((n) => n.status === 'up' && nodeSatisfies(n, agent))
-    .map((n) => ({ n, free: (n.budget?.maxAgents ?? 0) - countAssigned(n.nodeId) }))
-    .filter((x) => x.free > 0)
-    .sort((a, b) => b.free - a.free); // spread load
-  if (!candidates.length) {
+  let node = pickNode(agent, new Set(agent.failedNodes || []));
+  // If every capable node has already failed this agent, clear the blocklist and try them all again
+  // (a node may have been fixed / freed up) rather than wedging the agent in PENDING forever.
+  if (!node && agent.failedNodes?.length) { agent.failedNodes = []; node = pickNode(agent, new Set()); }
+  if (!node) {
     agent.nodeId = null;
     agent.state = STATE.PENDING;
     return;
   }
-  agent.nodeId = candidates[0].n.nodeId;
+  agent.nodeId = node.nodeId;
   agent.state = STATE.SCHEDULED;
+  agent.placedAt = now(); // start the watchdog clock for this placement
   log(`scheduled ${agent.id} (${agent.name}) -> ${agent.nodeId}`);
 }
 
@@ -216,6 +232,18 @@ setInterval(() => {
         a.nodeId = null;
       }
     }
+  }
+  // Watchdog: an agent SCHEDULED long enough that the node should have started it, but it's still not
+  // running, can't run there — bounce it off that node (remember it) so the reschedule below moves it
+  // to a different one. Keeps trying; logs loudly once it's exhausted several nodes.
+  for (const a of store.listAgents((a) => a.desired === 'running' && a.state === STATE.SCHEDULED && a.nodeId && t - (a.placedAt || 0) > STUCK_MS)) {
+    a.failedNodes = [...new Set([...(a.failedNodes || []), a.nodeId])];
+    a.placeAttempts = (a.placeAttempts || 0) + 1;
+    log(`agent ${a.id} stuck on ${a.nodeId} (${Math.round((t - (a.placedAt || 0)) / 1000)}s, never started) — re-placing [attempt ${a.placeAttempts}]`);
+    if (a.placeAttempts >= MAX_PLACE_ATTEMPTS) log(`⚠ agent ${a.id} (${a.name}) failed to start on every node tried — check the node-host workload/logs`);
+    a.nodeId = null;
+    a.state = STATE.PENDING;
+    changed = true;
   }
   for (const a of store.listAgents((a) => a.desired === 'running' && (!a.nodeId || a.state === STATE.PENDING || a.state === STATE.FAILED))) {
     schedule(a);
@@ -279,6 +307,8 @@ r.post('/v1/nodes/heartbeat', async (ctx) => {
       assignments.push({ action: 'start', agent: { id: a.id, name: a.name, owner: a.owner, spec: a.spec, bundle: bundleBlockFor(a), signer: signerBlockFor(a) } });
     } else if (a.desired === 'running' && isRunning) {
       a.state = STATE.RUNNING;
+      // It actually started here — clear the watchdog's failure memory so a future reschedule is fresh.
+      if (a.placeAttempts || a.failedNodes?.length) { a.placeAttempts = 0; a.failedNodes = []; }
     } else if (a.desired !== 'running' && isRunning) {
       a.state = STATE.STOPPING;
       assignments.push({ action: 'stop', agentId: a.id });
