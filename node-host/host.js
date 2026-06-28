@@ -12,8 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { buildAgentEnv } from './env.js';
 import { verifyBundle, unpackTo } from '../lib/bundle.js';
 import { pullBytes } from '../lib/bundle-store.js';
-import { createEgressProxy, resolveEgressHosts } from './egress-proxy.js';
-import { detectOciRuntime, buildContainerSpec } from './oci.js';
+import { resolveEgressHosts } from './egress-proxy.js';
+import { detectOciRuntime, buildContainerSpec, DEFAULT_OCI_IMAGE } from './oci.js';
 import { loadOrCreateNodeKey, signNodeHeaders } from '../lib/node-auth.js';
 import { isFirstPartyNodeRuntime } from '../lib/proto.js';
 
@@ -48,13 +48,14 @@ const CFG = {
     rpc: process.env.CIRCUIT_RPC_URL || '',
     jupiter: process.env.CIRCUIT_JUPITER_URL || 'https://api.jup.ag',
   },
-  // How a container reaches the host-side proxy (the egress-network gateway by default).
-  proxyGateway: process.env.CIRCUIT_PROXY_GATEWAY || '172.17.0.1',
-  // The ISOLATED docker network untrusted oci bundles run on — must have no route except the proxy.
-  // Unset → the node fails closed and refuses oci bundles (HTTPS_PROXY alone is not containment).
+  // The ISOLATED (--internal) docker network untrusted oci bundles run on — no route out except the
+  // egress-proxy SIDECAR container. Unset → the node fails closed and refuses oci bundles.
   egressNetwork: process.env.CIRCUIT_EGRESS_NETWORK || '',
-  // Address the per-agent egress proxy binds to (the egress-net gateway, NOT 0.0.0.0).
-  proxyBind: process.env.CIRCUIT_PROXY_BIND || '127.0.0.1',
+  // The external network the egress-proxy sidecar ALSO joins so IT (and only it) can reach the allowed
+  // hosts. The agent never joins this — its single path out is the proxy container.
+  proxyExternalNetwork: process.env.CIRCUIT_PROXY_EXTERNAL_NETWORK || 'bridge',
+  // Pinned container image (digest) for the agent + the proxy sidecar.
+  ociImage: process.env.CIRCUIT_OCI_IMAGE || DEFAULT_OCI_IMAGE,
   // seccomp profile path for untrusted containers ('default' = docker's default; pin a tight one in prod).
   seccompProfile: process.env.CIRCUIT_SECCOMP_PROFILE || 'default',
   // Publishers allowed to use the unsandboxed 'node' runtime. Empty = own-fleet (allow all); when set,
@@ -102,9 +103,25 @@ async function resolveWorkload(a, dir) {
 }
 
 // B1/B2 — pull → verify (sha256 + manifest sig + owner binding) → unpack (cache by sha256) → run.
+// Start the egress-proxy SIDECAR for an untrusted agent: a container on the agent's --internal network
+// (so the agent reaches it by name) that ALSO joins an external bridge (so it, and ONLY it, can reach
+// the allowed hosts). Runs our first-party proxy code from the repo, read-only + hardened. The agent
+// never joins the external network, so its single route out is this proxy + its allowlist.
+function startEgressSidecar(rt, name, allowedHosts) {
+  try { execFileSync(rt, ['rm', '-f', name], { stdio: 'ignore' }); } catch {} // clear a stale sidecar
+  execFileSync(rt, [
+    'run', '-d', '--name', name, '--network', CFG.egressNetwork,
+    '--read-only', '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges', '--tmpfs', '/tmp',
+    '-v', `${REPO}:/proxy:ro`,
+    '-e', `CIRCUIT_EGRESS_ALLOW=${allowedHosts.join(',')}`, '-e', 'CIRCUIT_PROXY_PORT=8888',
+    CFG.ociImage, 'node', '/proxy/node-host/egress-proxy-main.js',
+  ], { stdio: 'ignore' });
+  execFileSync(rt, ['network', 'connect', CFG.proxyExternalNetwork, name], { stdio: 'ignore' }); // proxy → allowed hosts
+}
+
 // No unverified bytes ever execute. runtime 'node' (trusted): run with node under the curated env +
 // cgroup + a read-only tree. runtime 'oci' (untrusted): run the SAME tree inside a hardened container
-// whose ONLY egress is this node's per-agent proxy.
+// whose ONLY egress is a dedicated egress-proxy sidecar container (above).
 async function resolveBundle(a, dir) {
   const b = a.bundle;
   if (!b) throw new Error('spec.bundle set but no bundle block in the assignment');
@@ -136,25 +153,25 @@ async function resolveBundle(a, dir) {
   if (!fs.existsSync(entryPath)) throw new Error(`bundle entry '${b.manifest.entry}' missing after unpack`);
 
   if (runtime === 'oci') {
-    // UNTRUSTED: run the verified tree inside a hardened container, reachable network = the proxy only.
+    // UNTRUSTED: run the verified tree inside a hardened container whose ONLY route out is the egress
+    // proxy SIDECAR (another container). The agent joins ONLY the --internal egress network; the proxy
+    // joins that network AND an external bridge, so it (and only it) reaches the allowed hosts.
     const rt = detectOciRuntime();
     if (!rt) throw new Error('node cannot run an oci (untrusted) bundle — no usable container runtime');
-    // FAIL CLOSED: refuse to run an untrusted bundle unless a real isolated egress network is configured.
-    // HTTPS_PROXY alone is not containment (a hostile agent ignores it), so without the locked network
-    // there is no boundary — we do NOT run the bundle rather than pretend.
+    // FAIL CLOSED: without the isolated network there is no boundary — refuse rather than pretend.
     if (!CFG.egressNetwork) throw new Error('refusing oci bundle — CIRCUIT_EGRESS_NETWORK (isolated, proxy-only) not configured');
     const allowedHosts = resolveEgressHosts(b.manifest.egress, CFG.egressEndpoints);
-    const proxy = createEgressProxy({ allowedHosts, onEvent: (ev, h, r) => { if (ev === 'deny') log(`egress DENY ${a.id} ${h} (${r})`); } });
-    await new Promise((res) => proxy.listen(0, CFG.proxyBind, res)); // bind to the egress-net gateway, not 0.0.0.0
-    const proxyPort = proxy.address().port;
+    const proxyName = `circuit-proxy-${a.id}`;
+    startEgressSidecar(rt, proxyName, allowedHosts); // throws if it can't establish the controlled path
     const env = buildAgentEnv(a, '/data'); // curated (untrusted → no secrets); /data is the in-container path
     const { command, args } = buildContainerSpec({
       runtime: rt, name: `circuit-${a.id}`, bundleDir: cacheDir, dataDir: dir, entry: b.manifest.entry,
-      env, network: CFG.egressNetwork, proxyUrl: `http://${CFG.proxyGateway}:${proxyPort}`,
+      env, network: CFG.egressNetwork, image: CFG.ociImage, proxyUrl: `http://${proxyName}:8888`,
       seccompProfile: CFG.seccompProfile, memMb: capMemMb(a),
     });
-    log(`oci bundle ${b.sha256.slice(0, 12)} → ${rt}; net=${CFG.egressNetwork} egress proxy ${CFG.proxyBind}:${proxyPort} allow=[${allowedHosts.join(',') || 'none'}]`);
-    return { command, args, proxy };
+    log(`oci bundle ${b.sha256.slice(0, 12)} → ${rt}; net=${CFG.egressNetwork} sidecar=${proxyName} allow=[${allowedHosts.join(',') || 'none'}]`);
+    // proxy.close() tears the sidecar container down when the agent exits.
+    return { command, args, proxy: { close: () => { try { execFileSync(rt, ['rm', '-f', proxyName], { stdio: 'ignore' }); } catch {} } } };
   }
   return { command: process.execPath, args: [entryPath], cwd: cacheDir };
 }

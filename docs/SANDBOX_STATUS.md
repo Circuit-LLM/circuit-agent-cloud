@@ -33,27 +33,32 @@ Covered by `test/{bundle,bundle-binding,ssrf}.test.mjs` (all green).
 Plus: pids/memory caps, content-addressed RO bundle mount. **A fully-isolated (`--internal`) untrusted
 agent cannot reach the internet, the host, or escape the container.**
 
-## The gap — controlled egress (FOUND, not yet fixed)
+## Controlled egress — BUILT (sidecar) + VERIFIED
 
-Untrusted agents that need to reach *allowed* Circuit hosts (data-api, inference, signer) go through a
-per-agent egress proxy + `lib/netguard.js` allowlist. **This path was never functional:**
-- the proxy runs as a **host process bound to the bridge gateway**, but a container on an `--internal`
-  net can't reach the gateway at all, and on a normal bridge the container-→-host-gateway path didn't
-  connect either;
-- the config defaults point the container's `HTTPS_PROXY` at the **wrong bridge** (`172.17.0.1`, the
-  default docker bridge, not the egress net's gateway).
+Untrusted agents that need to reach *allowed* Circuit hosts (data-api, inference, signer) go through an
+egress proxy + `lib/netguard.js` allowlist. The original design ran the proxy as a **host process bound
+to the bridge gateway**, which a container on an `--internal` net could never reach (and the config even
+pointed `HTTPS_PROXY` at the wrong bridge). **Fixed** — the proxy now runs as a **sidecar container** on
+two networks (`node-host/host.js startEgressSidecar` + `node-host/egress-proxy-main.js`):
+- the agent attaches ONLY to the `--internal` egress network (`CIRCUIT_EGRESS_NETWORK`) — no route out;
+- the proxy container attaches to that internal net AND an external bridge (`CIRCUIT_PROXY_EXTERNAL_NETWORK`,
+  default `bridge`), so it — and only it — can reach the allowlisted hosts;
+- the agent's `HTTPS_PROXY` resolves the proxy by container name over docker DNS.
 
-So today untrusted agents can only run **fully network-isolated**. Controlled egress needs a redesign.
+No fragile `DOCKER-USER` rules, no host-process reachability assumptions. The proxy is itself hardened
+(read-only, cap-drop ALL, no-new-privileges). The same `egress-proxy.js` allowlist + anti-DNS-rebind
+logic; only its placement changed.
 
-### Recommended fix (no host iptables)
-Run the egress proxy as a **sidecar container on two networks**:
-- `circuit-egress-internal` (`--internal`): the agent attaches ONLY here.
-- the proxy container attaches to BOTH that internal net AND a normal bridge.
-- agent → proxy (container-to-container over the internal net) → internet (proxy's external interface).
+**Verified live (`test/egress-sidecar.test.mjs`, docker-gated):**
+- agent → allowlisted host via proxy → **200** ✓
+- agent → non-allowlisted host via proxy → **denied** (`deny … not-allowlisted`) ✓
+- agent → direct internet (bypassing proxy) → **no route** ✓
 
-The agent has no path out except through the proxy container; no fragile `DOCKER-USER` rules, no
-host-process reachability assumptions. `egress-proxy.js` logic (allowlist + netguard) stays; only its
-*placement* changes (host process → sidecar container).
+### One follow-on for Node agents
+The proxy is enforced at the network layer (the agent's *only* route is the proxy), but a Node workload
+must actually *use* `HTTPS_PROXY` — global `fetch`/undici needs a `ProxyAgent` (or Node's env-proxy
+support), unlike `curl`. A first-party agent image can wire undici's `EnvHttpProxyAgent` as the default
+dispatcher so agent code "just works" through the allowlist.
 
 ## To make a node actually host untrusted agents
 1. operator in the `docker` group (so `detectOciRuntime()`'s `docker info` passes) — done on this box
