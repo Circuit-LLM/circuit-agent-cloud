@@ -197,6 +197,14 @@ function applyCgroup(pid, a) {
   }
 }
 
+// Surface a start/exit failure to the control plane (not just the local host log), so the operator
+// sees WHY an agent won't start via `circuit agent logs` instead of a silent re-place loop.
+function reportAgent(id, lines) {
+  if (!id) return;
+  const payload = lines.map((l) => (typeof l === 'string' ? { ts: Date.now(), line: l } : l));
+  api('POST', `/v1/agents/${id}/report`, { lines: payload }).catch(() => {});
+}
+
 async function startAgent(a) {
   if (agents.has(a.id)) return;
   if (agents.size >= CFG.maxAgents) { log(`refusing ${a.id} — at budget (${CFG.maxAgents})`); return; }
@@ -207,7 +215,11 @@ async function startAgent(a) {
 
   let resolved;
   try { resolved = await resolveWorkload(a, dir); }
-  catch (e) { log(`agent ${a.id} workload resolve failed: ${e.message}`); return; }
+  catch (e) {
+    log(`agent ${a.id} workload resolve failed: ${e.message}`);
+    reportAgent(a.id, [`✗ start failed (could not fetch/resolve the bundle): ${e.message}`]);
+    return;
+  }
   const { command, args, cwd, proxy } = resolved; // proxy: the per-agent egress proxy for an oci bundle
 
   // SECURITY: never hand the workload the operator's whole process.env (it may hold the operator's
@@ -229,8 +241,19 @@ async function startAgent(a) {
   };
   proc.stdout.on('data', onData);
   proc.stderr.on('data', onData);
+  proc.on('error', (e) => {                       // e.g. command not found / spawn failure
+    log(`agent ${a.id} spawn error: ${e.message}`);
+    reportAgent(a.id, [`✗ start failed (spawn): ${e.message}`]);
+    agents.delete(a.id);
+  });
   proc.on('exit', (code, sig) => {
     log(`agent ${a.id} exited code=${code} sig=${sig}`);
+    // Died fast or non-zero = almost always a crash on startup (e.g. missing config/keys). Push the
+    // captured output + exit reason up so it shows in `circuit agent logs`, not just here.
+    const ranMs = Date.now() - rec.startedAt;
+    if (code !== 0 || ranMs < 5000) {
+      reportAgent(a.id, [...rec.logBuf.slice(-20).map((l) => l.line), `✗ process exited code=${code} sig=${sig} after ${Math.round(ranMs / 1000)}s`]);
+    }
     try { rec.proxy?.close(); } catch {} // tear down the per-agent egress proxy
     agents.delete(a.id); // reconcile loop will restart if still desired (built-in backoff = next beat)
   });
@@ -316,7 +339,7 @@ async function beat() {
   // await, so firing them concurrently lets several pass the check before any claims a slot — the node
   // then runs over budget (e.g. 4 agents on a budget-2 node). Awaiting each makes the budget authoritative.
   for (const as of res.assignments || []) {
-    if (as.action === 'start') await startAgent(as.agent).catch((e) => log(`startAgent ${as.agent?.id} failed: ${e.message}`));
+    if (as.action === 'start') await startAgent(as.agent).catch((e) => { log(`startAgent ${as.agent?.id} failed: ${e.message}`); reportAgent(as.agent?.id, [`✗ start failed: ${e.message}`]); });
     else if (as.action === 'stop') stopAgent(as.agentId);
   }
   enforceMemory();
