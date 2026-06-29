@@ -569,4 +569,46 @@ r.get('/v1/bundles/:name', (ctx) => {
   ctx.res.end(buf);
 });
 
-r.listen(PORT, HOST, () => log(`control plane on http://${HOST}:${PORT}  state=${STATE_FILE}  bundles=${BUNDLE_DIR}  auth=${KEY ? 'on' : 'open'}`));
+// ── Bundle GC — reference-aware mark-and-sweep ────────────────────────────────────────────────────
+// A blob is "live" while any agent references its sha. Sweep blobs that are unreferenced AND older
+// than a grace window (the grace covers the upload→create gap + brief redeploy churn — an in-use or
+// just-uploaded bundle is never a candidate). DRY-RUN by default: set CIRCUIT_BUNDLE_GC=1 to delete.
+const BUNDLE_GC_LIVE        = process.env.CIRCUIT_BUNDLE_GC === '1';
+const BUNDLE_GC_GRACE_MS    = Number(process.env.CIRCUIT_BUNDLE_GC_GRACE_MS    || 24 * 3600 * 1000);
+const BUNDLE_GC_INTERVAL_MS = Number(process.env.CIRCUIT_BUNDLE_GC_INTERVAL_MS || 24 * 3600 * 1000);
+const BUNDLE_DISK_WARN      = Number(process.env.CIRCUIT_BUNDLE_DISK_WARN_BYTES || 5 * 1024 * 1024 * 1024);
+
+function bundleGcSweep(doDelete = BUNDLE_GC_LIVE) {
+  const report = { applied: doDelete, kept: 0, candidates: [], freedBytes: 0, totalBytes: 0 };
+  let files;
+  try { files = fs.readdirSync(BUNDLE_DIR); } catch { return report; }
+  const live = new Set();                                          // mark — every agent's referenced sha
+  for (const a of store.listAgents()) { const sha = a?.spec?.bundle?.sha256; if (sha) live.add(`${sha}.tgz`); }
+  const cutoff = now() - BUNDLE_GC_GRACE_MS;
+  for (const f of files) {
+    const p = path.join(BUNDLE_DIR, f);
+    let st; try { st = fs.statSync(p); } catch { continue; }
+    if (f.endsWith('.tmp')) { if (st.mtimeMs < cutoff) { try { fs.unlinkSync(p); } catch {} } continue; } // orphaned interrupted upload
+    if (!/^[0-9a-f]{64}\.tgz$/.test(f)) continue;
+    report.totalBytes += st.size;
+    if (live.has(f) || st.mtimeMs > cutoff) { report.kept++; continue; } // referenced or within grace → keep
+    report.candidates.push({ sha: f.slice(0, 12), bytes: st.size, ageH: Math.round((now() - st.mtimeMs) / 3600000) });
+    report.freedBytes += st.size;
+    if (doDelete) { try { fs.unlinkSync(p); } catch (e) { log(`bundle-gc: delete ${f} failed: ${e.message}`); } }
+  }
+  return report;
+}
+
+function runGc(doDelete) {
+  let r; try { r = bundleGcSweep(doDelete); } catch (e) { log('bundle-gc error:', e.message); return { error: e.message }; }
+  if (r.candidates.length) log(`bundle-gc${r.applied ? '' : ' [dry-run]'}: ${r.candidates.length} orphan(s) ${r.applied ? 'deleted' : 'would delete'} (${(r.freedBytes / 1048576).toFixed(1)}MB) · ${r.kept} kept`);
+  if (r.totalBytes > BUNDLE_DISK_WARN) log(`bundle-gc: WARNING store is ${(r.totalBytes / 1073741824).toFixed(2)}GB (> ${(BUNDLE_DISK_WARN / 1073741824).toFixed(1)}GB)`);
+  return r;
+}
+setTimeout(() => runGc(), 60_000).unref();                         // first sweep ~1min after startup
+setInterval(() => runGc(), BUNDLE_GC_INTERVAL_MS).unref();
+
+// Admin: report what GC would do (dry-run), or ?apply=1 to delete now regardless of the env flag.
+r.post('/v1/bundles/gc', (ctx) => { auth(ctx); return runGc(ctx.query.apply === '1'); });
+
+r.listen(PORT, HOST, () => log(`control plane on http://${HOST}:${PORT}  state=${STATE_FILE}  bundles=${BUNDLE_DIR}  gc=${BUNDLE_GC_LIVE ? 'on' : 'dry-run'}  auth=${KEY ? 'on' : 'open'}`));
