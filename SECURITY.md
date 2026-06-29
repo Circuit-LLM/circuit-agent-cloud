@@ -26,7 +26,7 @@ never by the node that runs the agent.
     (set at create / via the owner route) — never an arbitrary destination, so it's not a
     drain vector. The owner skims or fully recovers without exposing the key.
   - **`export`** hands the owner the wallet's private key to take full self-custody. After
-    export the off-box guarantee no longer holds for that wallet (the key now exists
+    export the off-box property no longer holds for that wallet (the key now exists
     elsewhere) — a deliberate owner choice.
   - **`destroy` fails closed on a non-empty wallet** (the key-wipe is irreversible), telling
     you to withdraw/export first; `force` overrides to abandon remaining funds.
@@ -40,7 +40,7 @@ never by the node that runs the agent.
   (a live sell is priced on the SOL it returns, so it can't slip the caps),
   cooldown, and token allow/deny lists.
 
-Custody guarantees **no drain**. On its own it bounds a hostile host to an *in-policy*
+Custody is designed for **no drain**. On its own it bounds a hostile host to an *in-policy*
 `buy`/`sell` — but since the agent runs on the host's CPU, *which* in-policy trade fires is
 the host's to pick until you close it. **Verified Intents** closes it in software (any CPU);
 **Sealed Agents** closes it in hardware (any strategy). Both below — for a trading agent,

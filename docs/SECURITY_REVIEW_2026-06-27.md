@@ -57,7 +57,7 @@ nodes, and the agent points at Circuit's own data-api. **B2 (untrusted bundles f
 live and cannot even run here** (no usable container runtime → `detectOciRuntime()` = null, fails safe).
 So **none of these are "the running system is compromised."** They sort into:
 
-- **(A) Network isolation broken** — defeats the *B2* untrusted-egress guarantee. Must-fix before B2 ships.
+- **(A) Network isolation broken** — defeats the *B2* untrusted-egress containment. Must-fix before B2 ships.
 - **(B) Bundle-verification gaps** — weaken the "only verified bytes run" invariant *regardless of tenancy*.
 - **(C) Multi-tenant trust gaps** — must-fix before untrusted *publishers/operators*; partly known/documented.
 - **(D) Secret hygiene** — a hosted bundle gets more than it should.
@@ -286,7 +286,7 @@ tx only touches the user's accounts before signing).
 | LOW | — | B6, B7 | — | D2 | E5, E6, E7, E8 |
 
 **Recommended fix order** (cheap + high-impact first):
-1. **A1 `--network` internal + A2/A3 connect-to-validated-IP + A4 port-pin** — restores the B2 egress guarantee.
+1. **A1 `--network` internal + A2/A3 connect-to-validated-IP + A4 port-pin** — restores the B2 egress containment.
 2. **B1 `entry` validation + B2 sign egress/resources + B3 cap resources** — closes the verification escapes.
 3. **D1 RPC-URL handling for untrusted bundles** — stop leaking the keyed RPC URL.
 4. **E1 pin x402 recipient + cumulative budget** — stop attacker-controlled drain.

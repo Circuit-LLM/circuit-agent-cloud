@@ -17,7 +17,7 @@ submit `buy`/`sell` intents of **its own choosing** within the owner's policy. W
 
 ## 1. The problem, precisely
 
-### What's already guaranteed (today, "L0")
+### What's already enforced (today, "L0")
 
 The off-box signer holds each agent's key sealed at rest; the host gets only a scoped **session token**
 + a monotonic **epoch** (the fence). The signer's vocabulary is `buy | sell` — **no transfer/withdraw** —
@@ -131,9 +131,9 @@ tamper-evident *at rest*. That gives us two real, valuable things — but **not*
 - ✅ **The authorization/policy logic can be IPFS-pinned** (exactly how Lit Actions work): the signer (or
   MPC network) enforces a content-addressed program, so the rules are public and immutable.
 - ❌ **IPFS cannot make the host run that code honestly.** Content-addressing proves *what* the code is,
-  never *that it executed faithfully*. That guarantee comes from the TEE (2.1) or the proof (2.2).
+  never *that it executed faithfully*. That assurance comes from the TEE (2.1) or the proof (2.2).
 
-> **So: IPFS is the *anchor* (what), TEE/ZK/MPC is the *guarantee* (honestly executed). Use IPFS for the
+> **So: IPFS is the *anchor* (what), TEE/ZK/MPC is the *integrity* (honest execution). Use IPFS for the
 > image + policy identity; use a TEE for the integrity.** This is precisely the ROFL (attest a CID'd
 > image) and Lit (IPFS-pinned signing logic) pattern.
 
@@ -214,7 +214,7 @@ This is a network change, not just an SDK change.
 
 ## 5. Migration — shippable layers
 
-| Layer | What ships | Guarantee | New hardware? |
+| Layer | What ships | Protection | New hardware? |
 |---|---|---|---|
 | **L0** (today) | off-box key · `buy/sell`-only · policy · paper-default | **no drain**; live trades host-influenceable, bounded by caps | no |
 | **L1** | authenticated inputs (zkTLS) + a declared thin decision-gate the signer checks | host can't trigger trades with fake data; constrained strategies host-resistant | no |

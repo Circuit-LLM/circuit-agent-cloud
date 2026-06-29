@@ -224,7 +224,7 @@ r.post('/v1/agents/:id/withdraw', async (ctx) => {
 
 // OWNER KEY EXPORT. Returns the agent wallet's secret key so the owner can take full
 // custody (import into any wallet). This INTENTIONALLY hands out the key — after export the
-// off-box "can't be stolen" guarantee no longer holds for this wallet, so it's a deliberate
+// off-box "can't be stolen" property no longer holds for this wallet, so it's a deliberate
 // owner action behind the operator bearer. The agent should be stopped first.
 r.post('/v1/agents/:id/export', (ctx) => {
   auth(ctx);

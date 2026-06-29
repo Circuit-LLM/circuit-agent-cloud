@@ -181,7 +181,7 @@ of scope here; noted for later.
 
 "Validate, don't isolate" only protects what the signer can **re-check**. Three tiers:
 
-| Tier | Strategy shape | Guarantee |
+| Tier | Strategy shape | Property |
 |---|---|---|
 | **T1 — deterministic rule** | `buy if price < X and rsi > Y` over signed/zkTLS inputs | **fully prevented** — signer re-runs the rule; host can't forge |
 | **T2 — signed AI** | decision = a **signed inference verdict** from Circuit's DLLM over signed inputs | **prevented**, *modulo trusting the inference network's signature* (the host can't fake the verdict; the mesh produced + signed it) |
@@ -259,7 +259,7 @@ This spans the whole ecosystem; here's what each repo must do.
   (owner-signed), pass to the signer at provision; agent spec carries `ruleId`.
 - **node-host / agentd** — the reference workload collects evidence (calls signed data + inference) and
   submits a verified intent; demonstrates the rule template.
-- **SECURITY.md / README** — document the verified-intent guarantee + the software/hardware split.
+- **SECURITY.md / README** — document the verified-intent property + the software/hardware split.
 
 ### `circuit-data-api`
 - Add a **response-signing layer**: an ed25519 signing key; sign responses (`canonical(data,ts,nonce,path)`)
@@ -315,7 +315,7 @@ be messed with") without the precise boundary. Fix it everywhere, consistently:
 - Sweep for over-claims: anywhere that implies an agent is fully tamper-proof today gets qualified.
 
 **circuit-agent-cloud**
-- `README.md` + `SECURITY.md` — add the verified-intent guarantee; present the **software (Verified
+- `README.md` + `SECURITY.md` — add the verified-intent property; present the **software (Verified
   Intents) vs hardware (Sealed Agents)** options as the two roads to "host can't influence trades," with
   the residuals; link both `docs/` specs.
 

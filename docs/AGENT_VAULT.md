@@ -37,7 +37,7 @@ code anyone can read.
 
 ## 2. Design principles
 
-- **The chain is the enforcer, not Circuit.** Every fund-safety guarantee is a program invariant, not an
+- **The chain is the enforcer, not Circuit.** Every fund-safety property is a program invariant, not an
   off-chain policy. If the program can't prove it, we don't claim it.
 - **Powerless delegate.** The agent holds only a `delegate` key that the program restricts to `trade`. It
   can churn the position; it can never remove value. So it's safe on an untrusted host, and losing/leaking
@@ -98,7 +98,7 @@ under its instruction rules — can move them.
 | `close_vault` | **owner** | After draining, close accounts and reclaim rent. |
 
 Note what's **absent**: there is no instruction the `delegate` can call that moves value out. The delegate
-can call exactly one thing — `trade` — and `trade` cannot pay out. That's the whole guarantee, in the
+can call exactly one thing — `trade` — and `trade` cannot pay out. That's the whole protection, in the
 shape of the API.
 
 ---
@@ -190,7 +190,7 @@ of arbitrary tokens, enforced by math.
 - **A breach of Circuit's servers:** nothing to steal — there are no keys and no privileged fund path.
 - **The owner (user):** sovereign — withdraw, rotate, pause, close. The only one who can move value out.
 
-**Invariants the program guarantees (and the tests assert):**
+**Invariants the program enforces (and the tests assert):**
 1. Only `owner` can reduce the vault's total value to an external account (`withdraw`).
 2. `delegate` calling `trade` cannot reduce vault value beyond slippage (`after_out >= min_out`).
 3. No instruction lets `delegate` set `owner`, `withdraw`, or `set_delegate`.
