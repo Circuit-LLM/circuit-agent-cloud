@@ -3,11 +3,14 @@
 // Stateless API over an in-memory+JSON store. Nodes POLL it (heartbeat), so
 // hosts need no inbound connectivity. The CLI drives agents through it.
 import os from 'node:os';
+import fs from 'node:fs';
 import path from 'node:path';
 import { Router, sendJson } from '../lib/http.js';
 import { Store } from '../lib/store.js';
 import { STATE, nodeSatisfies, normalizePolicy, normalizeVerified, newId, now } from '../lib/proto.js';
 import { verifyManifest } from '../lib/bundle.js';
+import { sha256hex } from '../lib/ed25519.js';
+import { MAX_BUNDLE_BYTES } from '../lib/bundle-store.js';
 import { verifyOwnerRequest, NonceStore } from '../lib/owner-auth.js';
 import { verifyNodeRequest } from '../lib/node-auth.js';
 
@@ -33,6 +36,23 @@ const SIGNER_PUBLIC_URL = (process.env.CIRCUIT_SIGNER_PUBLIC_URL || SIGNER_URL).
 const SIGNER_KEY = process.env.CIRCUIT_SIGNER_KEY || '';
 
 const store = new Store(STATE_FILE);
+
+// Shared bundle store — the content-addressed blob backend nodes pull from (next to the state file).
+const BUNDLE_DIR = process.env.CIRCUIT_BUNDLE_DIR || path.join(path.dirname(STATE_FILE), 'bundles');
+fs.mkdirSync(BUNDLE_DIR, { recursive: true });
+
+function readRaw(req, max) {
+  return new Promise((resolve, reject) => {
+    const chunks = []; let len = 0;
+    req.on('data', (c) => {
+      len += c.length;
+      if (len > max) { req.destroy(); reject(Object.assign(new Error('bundle exceeds size cap'), { status: 413 })); }
+      else chunks.push(c);
+    });
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', reject);
+  });
+}
 
 const log = (...a) => console.log(`[${new Date().toISOString()}] [cp]`, ...a);
 
@@ -515,4 +535,38 @@ r.put('/v1/nodes/:id/trust', (ctx) => {
   return { node: { nodeId: n.nodeId, trusted: n.trusted } };
 });
 
-r.listen(PORT, HOST, () => log(`control plane on http://${HOST}:${PORT}  state=${STATE_FILE}  auth=${KEY ? 'on' : 'open'}`));
+// ── Shared bundle store ─────────────────────────────────────────────────────────────────────────
+// The content-addressed blob backend every node pulls from (so an agent published on machine A runs
+// on machine B). Bytes are content-addressed + signed, so the store is LOW-TRUST: the node re-verifies
+// sha256 + manifest signature + owner-binding before a byte runs (resolveBundle in node-host). PUT is
+// owner-signed (anti-abuse); GET is open (integrity is enforced downstream, not here).
+r.putRaw('/v1/bundles/:name', async (ctx) => {
+  const m = /^([0-9a-f]{64})\.tgz$/.exec(ctx.params.name);
+  if (!m) { const e = new Error('bundle name must be <sha256>.tgz'); e.status = 400; throw e; }
+  const sha = m[1];
+  const ownerPath = new URL(ctx.req.url, 'http://x').pathname;
+  const owner = verifyOwnerRequest({ method: 'PUT', path: ownerPath, body: {}, headers: ctx.req.headers }, { nonceStore });
+  if (!owner) { const e = new Error('owner signature required to upload a bundle'); e.status = 401; throw e; }
+  const buf = await readRaw(ctx.req, MAX_BUNDLE_BYTES);            // reject unauthorized BEFORE reading the body
+  if (sha256hex(buf) !== sha) { const e = new Error('bytes do not match the sha256 in the path'); e.status = 400; throw e; }
+  const file = path.join(BUNDLE_DIR, `${sha}.tgz`);
+  if (!fs.existsSync(file)) {                                     // content-addressed → write-once, idempotent
+    const tmp = file + '.tmp';
+    fs.writeFileSync(tmp, buf);
+    fs.renameSync(tmp, file);
+    log(`bundle ${sha.slice(0, 12)} stored (${buf.length}b) by ${owner.slice(0, 8)}`);
+  }
+  return { ok: true, sha256: sha, bytes: buf.length };
+});
+
+r.get('/v1/bundles/:name', (ctx) => {
+  const m = /^([0-9a-f]{64})\.tgz$/.exec(ctx.params.name);
+  if (!m) { sendJson(ctx.res, 400, { error: 'bundle name must be <sha256>.tgz' }); return; }
+  const file = path.join(BUNDLE_DIR, `${m[1]}.tgz`);
+  if (!fs.existsSync(file)) { sendJson(ctx.res, 404, { error: 'bundle not found' }); return; }
+  const buf = fs.readFileSync(file);
+  ctx.res.writeHead(200, { 'Content-Type': 'application/gzip', 'Content-Length': buf.length });
+  ctx.res.end(buf);
+});
+
+r.listen(PORT, HOST, () => log(`control plane on http://${HOST}:${PORT}  state=${STATE_FILE}  bundles=${BUNDLE_DIR}  auth=${KEY ? 'on' : 'open'}`));
