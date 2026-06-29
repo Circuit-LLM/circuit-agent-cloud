@@ -13,7 +13,7 @@ import { buildAgentEnv } from './env.js';
 import { verifyBundle, unpackTo } from '../lib/bundle.js';
 import { pullBytes } from '../lib/bundle-store.js';
 import { resolveEgressHosts } from './egress-proxy.js';
-import { detectOciRuntime, buildContainerSpec, DEFAULT_OCI_IMAGE } from './oci.js';
+import { detectOciRuntime, detectMicroVm, buildContainerSpec, DEFAULT_OCI_IMAGE } from './oci.js';
 import { loadOrCreateNodeKey, signNodeHeaders } from '../lib/node-auth.js';
 import { isFirstPartyNodeRuntime } from '../lib/proto.js';
 
@@ -58,6 +58,10 @@ const CFG = {
   ociImage: process.env.CIRCUIT_OCI_IMAGE || DEFAULT_OCI_IMAGE,
   // seccomp profile path for untrusted containers ('default' = docker's default; pin a tight one in prod).
   seccompProfile: process.env.CIRCUIT_SECCOMP_PROFILE || 'default',
+  // B3 (§5.7): the container engine's runtime handler that launches each container inside a microVM
+  // (own kernel). Default is the Kata containerd shim. Used only on a node that advertises sandbox=microvm
+  // (detectMicroVm() found /dev/kvm + a Kata runtime); the SAME hardened oci spec runs under it.
+  microvmRuntimeClass: process.env.CIRCUIT_MICROVM_RUNTIME_CLASS || 'io.containerd.kata.v2',
   // Publishers allowed to use the unsandboxed 'node' runtime. Empty = own-fleet (allow all); when set,
   // only these may run node-runtime bundles — every other publisher must ship 'oci'.
   firstPartyKeys: (process.env.CIRCUIT_FIRST_PARTY_KEYS || '').split(',').map((s) => s.trim()).filter(Boolean),
@@ -160,6 +164,10 @@ async function resolveBundle(a, dir) {
     if (!rt) throw new Error('node cannot run an oci (untrusted) bundle — no usable container runtime');
     // FAIL CLOSED: without the isolated network there is no boundary — refuse rather than pretend.
     if (!CFG.egressNetwork) throw new Error('refusing oci bundle — CIRCUIT_EGRESS_NETWORK (isolated, proxy-only) not configured');
+    // B3: if this node provides microVM isolation, run the SAME hardened container under the microVM
+    // runtime (own guest kernel). Strictly stronger than runc; transparent to the bundle (still an oci
+    // spec) — only the container engine's --runtime changes. Null on an ordinary oci node (host kernel).
+    const vmRuntime = resolveSandbox() === 'microvm' ? CFG.microvmRuntimeClass : null;
     const allowedHosts = resolveEgressHosts(b.manifest.egress, CFG.egressEndpoints);
     const proxyName = `circuit-proxy-${a.id}`;
     startEgressSidecar(rt, proxyName, allowedHosts); // throws if it can't establish the controlled path
@@ -167,9 +175,9 @@ async function resolveBundle(a, dir) {
     const { command, args } = buildContainerSpec({
       runtime: rt, name: `circuit-${a.id}`, bundleDir: cacheDir, dataDir: dir, entry: b.manifest.entry,
       env, network: CFG.egressNetwork, image: CFG.ociImage, proxyUrl: `http://${proxyName}:8888`,
-      seccompProfile: CFG.seccompProfile, memMb: capMemMb(a),
+      seccompProfile: CFG.seccompProfile, memMb: capMemMb(a), vmRuntime,
     });
-    log(`oci bundle ${b.sha256.slice(0, 12)} → ${rt}; net=${CFG.egressNetwork} sidecar=${proxyName} allow=[${allowedHosts.join(',') || 'none'}]`);
+    log(`oci bundle ${b.sha256.slice(0, 12)} → ${rt}${vmRuntime ? ` [microVM:${vmRuntime}]` : ''}; net=${CFG.egressNetwork} sidecar=${proxyName} allow=[${allowedHosts.join(',') || 'none'}]`);
     // proxy.close() tears the sidecar container down when the agent exits.
     return { command, args, proxy: { close: () => { try { execFileSync(rt, ['rm', '-f', proxyName], { stdio: 'ignore' }); } catch {} } } };
   }
@@ -308,12 +316,13 @@ function writeStatus() {
   } catch {}
 }
 
-// What isolation can this node actually enforce? Honest auto-detect: 'oci' only if a container runtime
-// is usable (so the scheduler never hands us an untrusted bundle we can't contain); else 'node'. The
-// operator can pin it via SANDBOX=none|node|oci.
+// What isolation can this node actually enforce? Honest auto-detect, strongest first: 'microvm' if KVM +
+// a Kata runtime give each agent its own kernel (B3); else 'oci' if a container runtime is usable; else
+// 'node'. The scheduler never hands us a bundle we can't contain. Operator override: SANDBOX=none|node|
+// oci|microvm.
 function resolveSandbox() {
   if (RESOLVED_SANDBOX) return RESOLVED_SANDBOX;
-  RESOLVED_SANDBOX = CFG.sandbox || (detectOciRuntime() ? 'oci' : 'node');
+  RESOLVED_SANDBOX = CFG.sandbox || (detectMicroVm() ? 'microvm' : (detectOciRuntime() ? 'oci' : 'node'));
   return RESOLVED_SANDBOX;
 }
 

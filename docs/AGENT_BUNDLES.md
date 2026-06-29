@@ -1,6 +1,8 @@
 # Agent Bundles — hosting arbitrary user agents on the mesh
 
-**Status:** B0 + B1 + B2 **BUILT & TESTED** (localnet); B3 (TEE) is future. Companion to
+**Status:** B0 + B1 + B2 **BUILT & TESTED** (localnet); B3 (microVM isolation) **scaffolded** —
+rank + detect + scheduler gating + container spec land (the live Kata run is gated on a node that
+actually has KVM + Kata); B4 (confidential microVM / TEE) is future. Companion to
 [SECURITY.md](../SECURITY.md), [VERIFIED_INTENTS.md](./VERIFIED_INTENTS.md), and
 [SEALED_AGENTS.md](./SEALED_AGENTS.md).
 
@@ -196,12 +198,56 @@ The agent has **no default route**. Its only reachable network endpoint is the n
 proxy in best-effort mode; an untrusted `oci` bundle is **wired so the proxy is the only path out**.
 
 ### 5.6 Node advertises what it can enforce
-A node registers `caps.sandbox: "oci" | "node" | "none"`. The scheduler places an **untrusted** bundle
-only on a node whose sandbox ≥ the bundle's requirement. A `none` node keeps running only the trusted
-built-in workloads — exactly today's behavior, unchanged.
+A node registers `caps.sandbox: "microvm" | "oci" | "node" | "none"` (strongest → weakest;
+`SANDBOX_RANK` in `lib/proto.js`). The scheduler places a bundle only on a node whose sandbox ≥ its
+requirement — the runtime's floor (`oci` ⇒ a container node; `node` ⇒ curated-env), raised to the
+owner's optional `spec.requireSandbox`. A `none` node keeps running only the trusted built-in workloads
+— exactly today's behavior, unchanged.
+
+Because `microvm` outranks `oci`, a microVM node runs every `oci` bundle VM-backed **transparently** (a
+free isolation upgrade); an owner sets `requireSandbox: "microvm"` to *insist* on a separate-kernel host.
+That requirement is an agent-spec field, **not** a signed manifest field — so demanding stronger
+isolation never changes the bundle bytes or signature.
 
 The agent **still can't touch funds** regardless of the sandbox — that's custody's job. The sandbox is
 the *other* direction.
+
+### 5.7 microVM — escape-proof isolation without a TEE (B3)
+
+§5.4's container is strong, but it **shares the host kernel** — so the residual (§9) is "a 0-day in the
+runtime/proxy → escape." A **microVM** closes exactly that: each agent runs inside a lightweight virtual
+machine with **its own guest kernel**, so reaching the host requires breaking the *hypervisor* (a tiny,
+purpose-built surface — this is why AWS runs untrusted Lambda/Fargate on Firecracker) instead of finding
+one of the many host-kernel bugs.
+
+**It needs only KVM, not a TEE.** microVM isolation rides on hardware virtualization (`/dev/kvm` — Intel
+VT-x / AMD-V), which is present on **~every consumer CPU**. That is the key property: strong,
+separate-kernel isolation on commodity hardware that has **no** confidential-computing silicon. (Secrecy
+— hiding the agent's memory *from* the host — is the orthogonal TEE property; that's B4, below.)
+
+**It reuses all of B2 — only the container runtime changes.** The recommended backend is **Kata
+Containers**, which runs an ordinary OCI container *inside* a microVM. So the artifact stays `oci`, the
+**signed manifest is untouched**, and `buildContainerSpec` is byte-for-byte identical except for one
+flag: `--runtime <kata>`. The read-only rootfs, dropped capabilities, `no-new-privileges`, seccomp,
+non-root UID, the egress-proxy sidecar, the curated env, and the resource caps **all carry over verbatim**
+(the VM's fixed vCPU/RAM allocation also *becomes* the resource cap, cleaner than cgroups). Firecracker
+direct (a VM-image artifact + a hand-managed tap device, no container engine) is a leaner future path with
+its own run path; this scaffolding gates on the Kata path.
+
+**Wiring (scaffolded):**
+- `detectMicroVm()` (`node-host/oci.js`) — honest detection: usable `/dev/kvm` **and** a Kata runtime, else
+  `null`. A node with neither advertises `oci` (or lower), never `microvm` — **fail-closed**, so the
+  scheduler never hands it microvm-required work.
+- `resolveSandbox()` (`node-host/host.js`) — auto-detect strongest-first: `microvm` → `oci` → `node`.
+- `SANDBOX_RANK` + `nodeSatisfies` (`lib/proto.js`) — `microvm:3` above `oci:2`; honors
+  `spec.requireSandbox`.
+- `buildContainerSpec({ …, vmRuntime })` — when the node is `microvm`, the `oci` launch path passes
+  `vmRuntime = CIRCUIT_MICROVM_RUNTIME_CLASS` (default `io.containerd.kata.v2`); otherwise the default
+  host-kernel runtime (runc).
+
+What's **not** in this pass: the live Kata run can't be exercised where there's no `/dev/kvm` + Kata, and
+the same operator-config discipline as B2 applies (the isolated egress network must still be present —
+`host.js` fails closed without it).
 
 ---
 
@@ -269,13 +315,16 @@ enforced at each phase.
 | Agent is forced into a bad trade | Verified Intents (signer re-derives) | host can *withhold*/time |
 | Host harms the agent's funds | off-box custody | none |
 | **Agent reads the operator's secrets** | **curated env (§5.1)** | none once `...process.env` is gone |
-| **Agent attacks the operator's machine/LAN** | **sandbox FS/cgroup/caps + egress proxy** | a 0-day in the runtime/proxy |
+| **Agent attacks the operator's machine/LAN** | sandbox FS/cgroup/caps + egress proxy; on a **`microvm`** node, a separate guest kernel (§5.7) | container node: a runtime/kernel 0-day. **`microvm` node: a hypervisor/VMM escape** — a tiny surface |
 | Node runs tampered/unbound code | bundle `sha256` + manifest sig + owner binding (§7) | none if verified |
-| Host reads the agent's strategy | — | **yes — use [Sealed Agents](./SEALED_AGENTS.md) (TEE)** |
+| Host reads the agent's strategy | — | a **confidential microVM** (B4 — SEV-SNP/TDX) closes it; see [Sealed Agents](./SEALED_AGENTS.md) |
 
-The one thing bundling + sandboxing does **not** give is **strategy secrecy** — the operator can still
-observe the running code/memory. That residual is exactly what the TEE path closes, and it composes: a
-sealed bundle runs in an attested enclave.
+microVM (§5.7, B3) shrinks the machine/LAN-escape residual from a host-kernel 0-day to a hypervisor break.
+The one thing isolation still does **not** give is **strategy secrecy** — even behind a separate kernel the
+operator owns the hypervisor and can read the guest's memory. That is closed by a **confidential microVM**
+(B4): the same VM run under a TEE (SEV-SNP/TDX) so the host can't read it either. It composes cleanly —
+**B4 is B3 plus encrypted memory** — and is the [Sealed Agents](./SEALED_AGENTS.md) goal realized as a
+confidential VM.
 
 ---
 
@@ -294,7 +343,8 @@ on-chain position reconstruction are unchanged — failover just carries a conte
 | **B0** | **leak fix** | — | **curated env in `startAgent`** (§5.1) | ✅ **built + tested** |
 | **B1** | trusted / own-fleet | `node` tarball + sha256 (local CAS) | curated env + cgroup v2 + RO tree (**no ns/seccomp**) | ✅ **built + tested** (publish → verify → unpack → spawn) |
 | **B2** | untrusted / community | content-addressed store + SSRF-safe pull | hardened container (RO rootfs, cap-drop, non-root, pids/mem) + **egress proxy (§6)** + sandbox-gated placement | ✅ **built + tested** (live container run gated on a usable runtime) |
-| **B3** | strategy-secret | OCI, attested | TEE ([Sealed Agents](./SEALED_AGENTS.md)) | ⏳ future |
+| **B3** | **escape-proof isolation** | `oci` (unchanged) | **microVM** — the same hardened container, own guest kernel via Kata/KVM (§5.7) | 🟡 **scaffolded** (rank + detect + gating + spec; live run gated on a KVM/Kata node) |
+| **B4** | strategy-secret | `oci`, attested | **confidential microVM** — B3 + a TEE (SEV-SNP/TDX): the host can't read guest memory either; the [Sealed Agents](./SEALED_AGENTS.md) goal | ⏳ future |
 
 - **B0** is a standalone security hotfix — ~20 lines, no new concepts, ships first and on its own.
 - **B1** is deliberately *small*: on a trusted node you do **not** need namespaces/seccomp (that's most of
@@ -302,7 +352,14 @@ on-chain position reconstruction are unchanged — failover just carries a conte
   node is trusted not to host hostile code. This makes "my own agent on my contributed nodes" real fast.
 - **B2** is where the real isolation lives, and it is **gated on the egress proxy (§6)** being built —
   that, not the OCI runtime, is the hard part and the thing the untrusted-safety claim rests on.
-- **B3** is a separate world; it must not block B1/B2.
+- **B3** (microVM) closes the one residual B2 leaves — a runtime/kernel 0-day escaping the *shared* kernel
+  — by giving each agent its own guest kernel. It needs only **KVM** (hardware virtualization, on ~all
+  consumer CPUs; **no TEE**), reuses the entire B2 path (only the container `--runtime` changes), and
+  ranks above `oci` so it upgrades existing bundles transparently.
+- **B4** (confidential microVM) is **B3 + a TEE**: the same microVM run under SEV-SNP/TDX so the operator
+  can't read the agent's memory/strategy either — *secrecy* layered on *isolation*, no redesign. It is the
+  [Sealed Agents](./SEALED_AGENTS.md) goal realized as a confidential VM; hardware-gated. B3/B4 must not
+  block B1/B2.
 
 ---
 
@@ -313,6 +370,12 @@ on-chain position reconstruction are unchanged — failover just carries a conte
   `oci`-capable nodes via `caps.sandbox`. Consider shipping the node-host itself as a container that
   carries the runtime (composes with the existing GPU-node Docker onboarding) — but nested containers
   need sysbox/privileged, which is its own decision.
+- **microVM (B3) needs KVM — and nested virt on cloud nodes.** It requires `/dev/kvm` (hardware
+  virtualization). Bare-metal and home machines have it; a node that is *itself* a cloud VM needs the
+  provider to expose **nested virtualization** (not always available, sometimes slower) — so a
+  contributor's real desktop is a *better* microVM host than a budget VPS. This narrows the `microvm` pool
+  the way the OCI runtime narrows the `oci` pool, and it fails closed the same way: no `/dev/kvm` + Kata →
+  the node advertises `oci` (or lower), never `microvm`, and simply isn't handed microvm-required work.
 - **Bundle cold-start.** Large `node_modules` make first-pull slow; require a bundled single-file dist,
   and lean on the sha256 cache for reschedules.
 - **Supply chain / reproducibility.** The manifest sig pins the publisher; pin/lock the SDK + deps so a

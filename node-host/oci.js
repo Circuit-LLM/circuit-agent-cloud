@@ -6,6 +6,7 @@
 // through the per-node egress proxy (HTTPS_PROXY) — no direct route out. The publisher ships a node
 // tarball; the runtime ('oci') just means "must run containerized."
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
 
 // Detect a usable OCI runtime. We require not just the binary but a working daemon/permissions, so an
 // absent or unusable runtime degrades honestly (the node won't advertise 'oci' and won't be handed
@@ -16,6 +17,26 @@ export function detectOciRuntime() {
       execFileSync(cmd, probe, { stdio: 'ignore', timeout: 5000 });
       return cmd;
     } catch { /* not usable */ }
+  }
+  return null;
+}
+
+// Detect a usable microVM backend (B3 — AGENT_BUNDLES.md §5.7). A microVM gives each agent its OWN
+// guest kernel, so a container escape needs a hypervisor break (a tiny VMM surface) instead of a
+// host-kernel 0-day. It needs only KVM (`/dev/kvm` — hardware virtualization, present on ~all consumer
+// CPUs; NO TEE required) plus a Kata runtime registered with the container engine — then the SAME
+// hardened oci container (buildContainerSpec) runs VM-backed via `--runtime`. Honest like
+// detectOciRuntime: no usable /dev/kvm or no Kata runtime → null → the node won't advertise 'microvm'
+// and the scheduler won't hand it a microvm-required bundle (fail-closed).
+//
+// Firecracker-direct (a VM-image artifact + a hand-managed tap device, no container engine) is the
+// leaner future path with its own run path — NOT this one; this scaffolding gates on the Kata path.
+export function detectMicroVm() {
+  try { fs.accessSync('/dev/kvm', fs.constants.R_OK | fs.constants.W_OK); }
+  catch { return null; } // no usable KVM → can't run a microVM at all
+  for (const cmd of ['kata-runtime', 'containerd-shim-kata-v2']) {
+    try { execFileSync(cmd, ['--version'], { stdio: 'ignore', timeout: 5000 }); return cmd; }
+    catch { /* not installed/usable */ }
   }
   return null;
 }
@@ -33,6 +54,11 @@ export const DEFAULT_OCI_IMAGE = 'node:20-bookworm-slim@sha256:2cf067cfed83d5ea9
 export function buildContainerSpec({
   runtime = 'docker', image = DEFAULT_OCI_IMAGE, name,
   bundleDir, dataDir, entry, env = {}, proxyUrl, network, seccompProfile = 'default', memMb = 512, pids = 256,
+  // B3 (§5.7): when set (e.g. 'io.containerd.kata.v2' / 'kata-runtime'), run this SAME hardened container
+  // inside a microVM — its own guest kernel, so escape needs a hypervisor break, not a host-kernel 0-day.
+  // Everything else (RO rootfs, dropped caps, seccomp, non-root, egress proxy, resource caps) is byte-for
+  // byte identical; the microVM is strictly an isolation upgrade. Null → default host-kernel runtime (runc).
+  vmRuntime = null,
 }) {
   if (!name || !bundleDir || !dataDir || !entry) throw new Error('buildContainerSpec: name/bundleDir/dataDir/entry required');
   if (!network) throw new Error('buildContainerSpec: an isolated egress network is required (HTTPS_PROXY is not containment)');
@@ -45,6 +71,7 @@ export function buildContainerSpec({
     : [];
   const args = [
     'run', '--rm', '--name', name,
+    ...(vmRuntime ? ['--runtime', vmRuntime] : []), // B3: microVM-backed runtime (own kernel); else host kernel
     '--network', network,                   // isolated net — only the egress proxy is reachable
     '--read-only',                         // RO rootfs
     '--cap-drop', 'ALL',                   // no Linux capabilities
