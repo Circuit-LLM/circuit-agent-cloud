@@ -51,14 +51,54 @@ export function signTransferTx(seed, message) {
   return Buffer.concat([compactU16(1), sig, message]).toString('base64');
 }
 
-async function rpc(url, method, params) {
-  const r = await fetch(url, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(20000),
-  });
+// RPC with failover. A single provider WILL eventually fail — an IP/provider block (HTTP 403
+// "your IP or provider is blocked"), an exhausted quota (HTTP 429 / code -32429 "max usage
+// reached"), or plain downtime — so `url` may be an ORDERED list and we advance to the next
+// endpoint on any availability error. Genuine method errors (bad params, a tx that fails on-chain)
+// are deterministic, so we surface them immediately rather than mask them behind a fallback. The
+// withdraw tx is signed once against a fixed blockhash, so re-broadcasting the same bytes to a
+// different endpoint is idempotent (same signature — it can never double-spend).
+const FAILOVER_HTTP = new Set([403, 408, 409, 425, 429, 500, 502, 503, 504]);
+const FAILOVER_RPC_CODE = new Set([-32429, -32005, -32004]); // max-usage / rate-limited / node behind
+
+async function rpcOnce(url, method, params) {
+  let r;
+  try {
+    r = await fetch(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }), signal: AbortSignal.timeout(20000),
+    });
+  } catch (e) {
+    throw Object.assign(new Error(`${method}: ${e.message}`), { transient: true }); // network/timeout
+  }
   const j = await r.json().catch(() => ({}));
-  if (j.error) throw new Error(`${method}: ${JSON.stringify(j.error)}`);
+  if (!r.ok) {
+    throw Object.assign(new Error(`${method}: ${j?.error?.message || `HTTP ${r.status}`}`),
+      { httpStatus: r.status, rpcCode: j?.error?.code, transient: FAILOVER_HTTP.has(r.status) });
+  }
+  if (j.error) {
+    throw Object.assign(new Error(`${method}: ${JSON.stringify(j.error)}`),
+      { rpcCode: j.error.code, transient: FAILOVER_RPC_CODE.has(j.error.code) });
+  }
   return j.result;
+}
+
+async function rpc(url, method, params) {
+  const list = (Array.isArray(url) ? url : [url]).map((u) => (u || '').trim()).filter(Boolean);
+  if (!list.length) throw Object.assign(new Error(`${method}: no RPC endpoint configured`), { status: 503, code: 'rpc-unavailable' });
+  let last;
+  for (let i = 0; i < list.length; i++) {
+    try { return await rpcOnce(list[i], method, params); }
+    catch (e) {
+      last = e;
+      if (!e.transient || i === list.length - 1) break; // hard error → surface now; last endpoint → done
+    }
+  }
+  if (last?.transient) {
+    throw Object.assign(new Error(`all ${list.length} RPC endpoint(s) unavailable — last error: ${last.message}`),
+      { status: 503, code: 'rpc-unavailable' });
+  }
+  throw last;
 }
 
 export async function getBalanceLamports(url, addressB58) {

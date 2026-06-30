@@ -39,9 +39,18 @@ const PORT = Number(process.env.PORT || 18981);
 const HOST = process.env.HOST || '127.0.0.1';
 const DATA_DIR = process.env.CIRCUIT_SIGNER_DIR || path.join(os.homedir(), '.circuit-signer');
 const KEY = process.env.CIRCUIT_SIGNER_KEY || ''; // bearer for control-plane calls (open if unset)
-// RPC for owner-recovery transfers (withdraw / safe-destroy balance checks). Swaps still go
-// through Jupiter Ultra; this is only the System-transfer path back to the owner.
-const RPC = process.env.CIRCUIT_SIGNER_RPC_URL || process.env.CIRCUIT_RPC_URL || 'https://api.mainnet-beta.solana.com';
+// RPC for owner-recovery transfers (withdraw / safe-destroy balance checks). A single provider
+// inevitably fails (IP/provider block, exhausted quota, downtime), so this is an ORDERED FAILOVER
+// LIST: the configured endpoint(s) first, then a keyless public fallback that is ALWAYS appended,
+// so a blocked or rate-limited primary can never take owner-withdraw offline. withdraw.js advances
+// down the list on any availability error. Swaps still go through Jupiter Ultra; this is only the
+// System-transfer path back to the owner. Add endpoints with CIRCUIT_SIGNER_RPC_URLS (comma-sep).
+const RPC = [
+  ...(process.env.CIRCUIT_SIGNER_RPC_URLS || '').split(','),
+  process.env.CIRCUIT_SIGNER_RPC_URL,
+  process.env.CIRCUIT_RPC_URL,
+  process.env.CIRCUIT_SIGNER_RPC_FALLBACK || 'https://api.mainnet-beta.solana.com',
+].map((s) => (s || '').trim()).filter(Boolean).filter((u, i, a) => a.indexOf(u) === i);
 const isPubkey = (s) => { try { return typeof s === 'string' && base58decode(s).length === 32; } catch { return false; } };
 // Live trading lands swaps via Jupiter Ultra (it broadcasts, so the signer needs
 // no RPC). lite-api is keyless+rate-limited; set JUPITER_ULTRA_API for the paid host.
